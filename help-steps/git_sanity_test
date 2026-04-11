@@ -108,12 +108,6 @@ git_sanity_test_submodules() {
    ## repository ('derivative-maker') is used for all verification, keeping
    ## signing policy centralized and avoiding duplication across repositories.
 
-   ## Export variables needed inside the foreach subshell.
-   ## dist_build_ignore_untagged, dist_build_ignore_uncommitted are already
-   ## exported by help-steps/parse-cmd when --allow-untagged/--allow-uncommitted
-   ## are used.
-   export sq_git_policy_file
-
    ## NOTE: The foreach body runs in a POSIX subshell per submodule.
    ## Bash functions (verify_ref, error, etc.) are NOT available.
    ## Use direct commands and exit 1 for errors.

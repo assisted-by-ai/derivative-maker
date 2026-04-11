@@ -153,6 +153,7 @@ update_repo() {
     ## not the commit ref that 'sq-git log' needs.
     ## Instead, 'git_sanity_test_submodules' verifies each submodule commit
     ## directly via 'sq-git log' after the update completes.
+    #"${git_verify_command_wrapper[@]}" -c merge.verifySignatures=true submodule update --init --recursive --jobs=200 --merge \
     git submodule update --init --recursive --jobs=200 --merge \
       || abort_update \
         'Submodule update failed!' \
@@ -231,6 +232,7 @@ update_repo() {
       ## This command updates Git submodules to the commit recorded in the parent repository. (derivative-maker)
       ## It modifies the submodule's Git HEAD, potentially overriding local changes.
       ## See note in tag path above re: merge.verifySignatures.
+      #"${git_verify_command_wrapper[@]}" -c merge.verifySignatures=true submodule update --init --recursive --jobs=200 --merge \
       git submodule update --init --recursive --jobs=200 --merge \
         || abort_update \
           'Submodule update failed!' \

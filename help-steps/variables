@@ -207,6 +207,7 @@ if [ ! "$dist_build_one_parsed" = "true" ]; then
 fi
 
 [[ -v sq_git_policy_file ]] || sq_git_policy_file="${source_code_folder_dist}/openpgp-policy.toml"
+export sq_git_policy_file
 
 ## TODO BUG: 'buildconfig.d' is being parsed after, not before this?
 ## NOTE: Variable 'dist_build_redistributable=true' is set in 'help-steps/dm-build-official'.
