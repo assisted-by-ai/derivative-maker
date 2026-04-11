@@ -146,12 +146,19 @@ update_repo() {
     ## Caution.
     ## This command updates Git submodules to the commit recorded in the parent repository. (derivative-maker)
     ## It modifies the submodule's Git HEAD, potentially overriding local changes.
-    "${git_verify_command_wrapper[@]}" -c merge.verifySignatures=true submodule update --init --recursive --jobs=200 --merge \
+    ##
+    ## NOTE: Not using 'merge.verifySignatures=true' here. git's GPG shim
+    ## interface (gpg.openpgp.program / sq-git-wrapper) cannot perform
+    ## policy-based verification because git only passes raw signature data,
+    ## not the commit ref that 'sq-git log' needs.
+    ## Instead, 'git_sanity_test_submodules' verifies each submodule commit
+    ## directly via 'sq-git log' after the update completes.
+    git submodule update --init --recursive --jobs=200 --merge \
       || abort_update \
         'Submodule update failed!' \
         "${dist_build_current_git_head}"
 
-    git_submodule_verify
+    git_sanity_test_submodules
 
   elif [ -n "${target_ref}" ]; then
     if ! verify_ref "${target_ref}" 'commit'; then
@@ -223,11 +230,12 @@ update_repo() {
       ## Caution.
       ## This command updates Git submodules to the commit recorded in the parent repository. (derivative-maker)
       ## It modifies the submodule's Git HEAD, potentially overriding local changes.
-      "${git_verify_command_wrapper[@]}" -c merge.verifySignatures=true submodule update --init --recursive --jobs=200 --merge \
+      ## See note in tag path above re: merge.verifySignatures.
+      git submodule update --init --recursive --jobs=200 --merge \
         || abort_update \
           'Submodule update failed!' \
           "${dist_build_current_git_head}" "${branch_reset_commit}"
-      git_submodule_verify
+      git_sanity_test_submodules
       verify_ref "${target_ref}" 'commit' \
         || abort_update \
           'Verification failed after submodule update!' \

@@ -98,22 +98,59 @@ ${bold}${under}--allow-untagged true${eunder} ${under}--allow-uncommitted true${
 "
 }
 
-git_submodule_uncommitted_check() {
-   local submodule_path_list submodule_path_item
+git_sanity_test_submodules() {
+   ## Comprehensive submodule checks: signature, untagged, uncommitted.
+   ## Uses 'git submodule foreach --recursive' for robustness (handles nested
+   ## submodules, paths with special characters, moved submodules).
+   ##
+   ## Submodule repositories intentionally do not include their own 'sq-git'
+   ## policy file ('openpgp-policy.toml'). A single policy file in the parent
+   ## repository ('derivative-maker') is used for all verification, keeping
+   ## signing policy centralized and avoiding duplication across repositories.
 
-   readarray -t submodule_path_list < <(
-      grep --fixed-strings 'path =' -- '.gitmodules' | awk -- '{ print $3 }'
-   )
-   for submodule_path_item in "${submodule_path_list[@]}"; do
-      ## grep would be better in so far that it supports '--fixed-strings'.
-      ## In the worst case, special characters might cause a spurious error message.
-      ## Hence, preferring speed (bash built-in string matching) over external utility 'grep'.
-      #if grep --fixed-strings -- "$submodule_path_item" &>/dev/null <<< "$git_status_str"; then
-      # shellcheck disable=SC2076
-      if [[ "${git_status_str}" =~ "${submodule_path_item}" ]]; then
-         printf '%s\n' "${cyan}INFO: Uncommitted changes detected in git submodule: '${under}${submodule_path_item}${eunder}'  ${reset}"
+   ## Export variables needed inside the foreach subshell.
+   ## dist_build_ignore_untagged, dist_build_ignore_uncommitted are already
+   ## exported by help-steps/parse-cmd when --allow-untagged/--allow-uncommitted
+   ## are used.
+   export sq_git_policy_file
+
+   ## NOTE: The foreach body runs in a POSIX subshell per submodule.
+   ## Bash functions (verify_ref, error, etc.) are NOT available.
+   ## Use direct commands and exit 1 for errors.
+   git submodule foreach --recursive '
+      submodule_head="$(git rev-parse HEAD)" || { echo "ERROR: Failed to get HEAD for submodule: $displaypath"; exit 1; }
+
+      ## 1. Signature verification using sq-git with parent repo policy file.
+      ## Always use --trust-root HEAD for submodules: the parent repo (already
+      ## verified) pins each submodule commit, so we only need to confirm each
+      ## submodule HEAD is signed by an authorized key.
+      if ! sq-git log --policy-file "$sq_git_policy_file" --trust-root HEAD -- "${submodule_head}^{commit}"; then
+         echo "ERROR: sq-git signature verification failed for submodule: $displaypath"
+         exit 1
       fi
-   done
+
+      ## 2. Untagged commit check. Submodule commits are tagged by convention.
+      if ! git describe --exact-match --tags HEAD >/dev/null 2>&1; then
+         if [ "${dist_build_ignore_untagged:-}" = "true" ]; then
+            echo "INFO: Untagged commit in submodule $displaypath, but --allow-untagged is set, continuing."
+         else
+            echo "ERROR: Untagged commit in submodule: $displaypath"
+            exit 1
+         fi
+      fi
+
+      ## 3. Uncommitted changes check.
+      submodule_status="$(git status --porcelain=v1 2>&1)"
+      if [ -n "$submodule_status" ]; then
+         if [ "${dist_build_ignore_uncommitted:-}" = "true" ]; then
+            echo "INFO: Uncommitted changes in submodule $displaypath, but --allow-uncommitted is set, continuing."
+         else
+            echo "ERROR: Uncommitted changes in submodule: $displaypath"
+            git status
+            exit 1
+         fi
+      fi
+   '
 }
 
 git_sanity_test_check_for_untagged_commits() {
@@ -186,8 +223,6 @@ Such as in case you added custom code.) ${reset}"
    git_sanity_test_hint
    true "${cyan}$BASH_SOURCE INFO: Running \"git status\" for your convenience. ${reset}"
    git status
-   ## Use '2>/dev/null' to hide xtrace.
-   git_submodule_uncommitted_check 2>/dev/null
    true "${cyan}$BASH_SOURCE INFO: Running git \"clean -d --force --force --dry-run\" for your convenience. ${reset}"
    git clean -d --force --force --dry-run
    true "${cyan}$BASH_SOURCE You most likely like to run:${reset}
@@ -200,39 +235,6 @@ ${under}git reset --hard${eunder}
 
    error "Uncommitted changes! See above!"
    true
-}
-
-git_submodule_verify() {
-   local submodule_path_list submodule_path_item submodule_head
-
-   ## Submodule repositories intentionally do not include their own 'sq-git'
-   ## policy file ('openpgp-policy.toml'). A single policy file in the parent
-   ## repository ('derivative-maker') is used for all verification, keeping
-   ## signing policy centralized and avoiding duplication across repositories.
-
-   readarray -t submodule_path_list < <(
-      grep --fixed-strings 'path =' -- '.gitmodules' | awk -- '{ print $3 }'
-   )
-
-   for submodule_path_item in "${submodule_path_list[@]}"; do
-      ## Not using '-d'. Can either be a folder or a file.
-      ## cat /home/user/derivative-maker/packages/kicksecure/anon-apt-sources-list/.git
-      ## > gitdir: ../../../.git/modules/packages/anon-apt-sources-list
-      if ! [ -e "${submodule_path_item}/.git" ]; then
-         error "INFO: Submodule '${submodule_path_item}' is not initialized."
-      fi
-      pushd "${submodule_path_item}" >/dev/null || error "Failed to enter submodule directory '${submodule_path_item}'!"
-      submodule_head="$(git rev-parse HEAD)" || {
-         popd >/dev/null
-         error "Failed to get HEAD commit for submodule '${submodule_path_item}'!"
-      }
-      true "INFO: Verifying submodule '${submodule_path_item}' at commit '${submodule_head}'..."
-      if ! verify_ref "${submodule_head}" 'commit'; then
-         popd >/dev/null
-         error "Verification failed for submodule '${submodule_path_item}'!"
-      fi
-      popd >/dev/null
-   done
 }
 
 git_sanity_test_main() {
@@ -250,7 +252,7 @@ git_sanity_test_main() {
    git_sanity_test_check_for_untagged_commits
    git_sanity_test_check_for_uncommitted_changes
 
-   git_submodule_verify
+   git_sanity_test_submodules
 }
 
 if [ "${git_sanity_test_was_sourced}" = 'false' ]; then
