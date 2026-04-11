@@ -78,7 +78,6 @@ verify_ref() {
   esac
 
   ## Policy: All git commits (at least HEAD) is always signed.
-  #"${git_verify_command_wrapper[@]}" verify-commit -- "${ref}^{commit}" || return 1
   signed_by_fingerprint "${ref}^{commit}" || return 1
 
   if [ "${ref_type}" = 'tag' ]; then
@@ -86,7 +85,6 @@ verify_ref() {
     ##
     ## NOTE: 'refs/tags/' is necessary to prevent ambiguity in the event of a
     ## tag with the same name as a branch or commit.
-    #"${git_verify_command_wrapper[@]}" verify-tag -- "refs/tags/${ref}" || return 1
     signed_by_fingerprint "${ref}" || return 1
   fi
 }
@@ -117,104 +115,44 @@ git_sanity_test_submodules() {
          'bash "$toplevel/help-steps/git_sanity_test_one" "$displaypath"'
 }
 
-git_sanity_test_check_for_untagged_commits() {
-   git_tag_nearest="$(git describe --always --abbrev=0)"
-   git_tag_current="$(git describe --always --abbrev=1000000000)"
-   git_tag_exact="$(git describe --exact-match --tags 2>/dev/null)" || true
+git_sanity_test_main() {
+   ## Main repo: run the same checks as submodules (signature, untagged,
+   ## uncommitted) via the shared helper script, then print verbose recovery
+   ## hints if any check failed.
+   ##
+   ## TOFU threat model: Initial digital software verification must be done
+   ## manually for stronger-than-TOFU security. See:
+   ## https://www.kicksecure.com/wiki/Dev/Build_Documentation/images
+   local test_one_exit_code=0
+   "$dist_source_help_steps_folder/git_sanity_test_one" "main repo" || test_one_exit_code=$?
 
-   ## Example git_tag_nearest:
-   ## 9.6
-
-   ## Example git_tag_current:
-   ## 10.0.0.3.7-developers-only-6-g505c39d44d2a08451f7ff53ce67d78745e05816b
-
-   true "${cyan}$BASH_SOURCE INFO: git_tag_nearest: $git_tag_nearest ${reset}"
-   true "${cyan}$BASH_SOURCE INFO: git_tag_current: $git_tag_current ${reset}"
-
-   if [ "$git_tag_nearest" == "$git_tag_current" ]; then
-      true "${cyan}$BASH_SOURCE INFO: git_tag_nearest equals git_tag_current. ${reset}"
-      if [ "$git_tag_current" == "$git_tag_exact" ]; then
-         true "${cyan}$BASH_SOURCE INFO: git_tag_current equals git_tag_exact. ${reset}"
-         true "${cyan}$BASH_SOURCE INFO: Git reports tagged commit. ${reset}"
-         verify_ref "${git_tag_exact}" 'tag'
-         return 0
-      fi
-   fi
-
-   if [ "$dist_build_ignore_untagged" = "true" ]; then
-      true "${bold}${cyan}$BASH_SOURCE INFO: Git reports a untagged commit! But you requested to ignore untagged commits, continuing... ${reset}"
-      return 0
-   fi
-
-   true "${bold}${red}---------------------------------------------------------------------${reset}"
-   true "${bold}${red}$BASH_SOURCE ERROR: Git reports an untagged commit! ${reset}"
-   true "${cyan}$BASH_SOURCE INFO: (And you are not using ${under}--allow-untagged true${eunder}, \
-which you also should not do for security reasons, unless you are a developer or advanced user and know what you are doing. \
-Such as in case you added custom commits.) ${reset}"
-   git_sanity_test_hint
-   true "${cyan}$BASH_SOURCE INFO: (See build documentation on how to verify and checkout git tags.)${reset}"
-   true "${bold}${red}---------------------------------------------------------------------${reset}"
-
-   error "Untagged commit! See above!"
-   true
-}
-
-git_sanity_test_check_for_uncommitted_changes() {
-   local git_status_str
-   git_status_str="$(git status --porcelain=v1 2>&1)" || error "'git status --porcelain=v1' failed."
-
-   if [ -z "$git_status_str" ]; then
-      true "INFO: No uncommitted changes found, ok."
-      return 0
-   fi
-
-   if [ "$dist_build_ignore_uncommitted" = "true" ]; then
-      true "${bold}${cyan}$BASH_SOURCE INFO: Git reports uncommitted changes! But you requested to ignore uncommitted changes, continuing... ${reset}"
+   if [ "$test_one_exit_code" != "0" ]; then
+      ## Verbose hints for interactive main repo use.
       git_sanity_test_hint
-      true "${cyan}$BASH_SOURCE INFO: Running \"git status\" for debugging. ${reset}"
-      git status
-      true "${cyan}$BASH_SOURCE INFO: Running git \"clean -d --force --force --dry-run\" for debugging. ${reset}"
-      git clean -d --force --force --dry-run
-      true
-      return 0
-   fi
-
-   true "${bold}${red}---------------------------------------------------------------------${reset}"
-   true "${bold}${red}$BASH_SOURCE ERROR: Git reports uncommitted changes! ${reset}"
-   true "${cyan}$BASH_SOURCE INFO: (And you are not using ${under}--allow-uncommitted true${eunder}, \
-which you also should not do for security reasons, unless you are a developer or advanced user and know what you are doing. \
-Such as in case you added custom code.) ${reset}"
-   git_sanity_test_hint
-   true "${cyan}$BASH_SOURCE INFO: Running \"git status\" for your convenience. ${reset}"
-   git status
-   true "${cyan}$BASH_SOURCE INFO: Running git \"clean -d --force --force --dry-run\" for your convenience. ${reset}"
-   git clean -d --force --force --dry-run
-   true "${cyan}$BASH_SOURCE You most likely like to run:${reset}
+      case "$test_one_exit_code" in
+         2)
+            ## Untagged.
+            true "${cyan}$BASH_SOURCE INFO: (See build documentation on how to verify and checkout git tags.)${reset}"
+            error "Untagged commit! See above!"
+            ;;
+         3)
+            ## Uncommitted.
+            true "${cyan}$BASH_SOURCE INFO: Running git \"clean -d --force --force --dry-run\" for your convenience. ${reset}"
+            git clean -d --force --force --dry-run
+            true "${cyan}$BASH_SOURCE You most likely like to run:${reset}
 ${under}$dist_source_help_steps_folder/cleanup-files${eunder}
 ${cyan}or if you know what you are doing:${reset}
 ${under}git clean -d --force --force${eunder}
 ${under}git reset --hard${eunder}
 "
-   true "${bold}${red}---------------------------------------------------------------------${reset}"
-
-   error "Uncommitted changes! See above!"
-   true
-}
-
-git_sanity_test_main() {
-   ## Sanity-check; verify the signature of the current ref. If the user has
-   ## never verified the repo before, this can be bypassed if the repo is
-   ## compromised, but if the repo is safe, this (in combination with the key
-   ## import above) will do the initial verification, providing "trust on first
-   ## use" (TOFU) security.
-   ##
-   ## TOFU threat model: Initial digital software verification must be done
-   ## manually for stronger-than-TOFU security. See:
-   ## https://www.kicksecure.com/wiki/Dev/Build_Documentation/images
-   verify_ref "${dist_build_current_git_head}" 'commit'
-
-   git_sanity_test_check_for_untagged_commits
-   git_sanity_test_check_for_uncommitted_changes
+            error "Uncommitted changes! See above!"
+            ;;
+         *)
+            ## Signature or other failure.
+            error "Verification failed for main repo! See above!"
+            ;;
+      esac
+   fi
 
    git_sanity_test_submodules
 }
