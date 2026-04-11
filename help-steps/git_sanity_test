@@ -107,44 +107,14 @@ git_sanity_test_submodules() {
    ## policy file ('openpgp-policy.toml'). A single policy file in the parent
    ## repository ('derivative-maker') is used for all verification, keeping
    ## signing policy centralized and avoiding duplication across repositories.
-
-   ## NOTE: The foreach body runs in a POSIX subshell per submodule.
-   ## Bash functions (verify_ref, error, etc.) are NOT available.
-   ## Use direct commands and exit 1 for errors.
-   git submodule foreach --recursive '
-      submodule_head="$(git rev-parse HEAD)" || { echo "ERROR: Failed to get HEAD for submodule: $displaypath"; exit 1; }
-
-      ## 1. Signature verification using sq-git with parent repo policy file.
-      ## Always use --trust-root HEAD for submodules: the parent repo (already
-      ## verified) pins each submodule commit, so we only need to confirm each
-      ## submodule HEAD is signed by an authorized key.
-      if ! sq-git log --policy-file "$sq_git_policy_file" --trust-root HEAD -- "${submodule_head}^{commit}"; then
-         echo "ERROR: sq-git signature verification failed for submodule: $displaypath"
-         exit 1
-      fi
-
-      ## 2. Untagged commit check. Submodule commits are tagged by convention.
-      if ! git describe --exact-match --tags HEAD >/dev/null 2>&1; then
-         if [ "${dist_build_ignore_untagged:-}" = "true" ]; then
-            echo "INFO: Untagged commit in submodule $displaypath, but --allow-untagged is set, continuing."
-         else
-            echo "ERROR: Untagged commit in submodule: $displaypath"
-            exit 1
-         fi
-      fi
-
-      ## 3. Uncommitted changes check.
-      submodule_status="$(git status --porcelain=v1 2>&1)"
-      if [ -n "$submodule_status" ]; then
-         if [ "${dist_build_ignore_uncommitted:-}" = "true" ]; then
-            echo "INFO: Uncommitted changes in submodule $displaypath, but --allow-uncommitted is set, continuing."
-         else
-            echo "ERROR: Uncommitted changes in submodule: $displaypath"
-            git status
-            exit 1
-         fi
-      fi
-   '
+   ##
+   ## NOTE: 'git submodule foreach' runs commands under /bin/sh, not bash.
+   ## Using a separate bash helper script ('git_sanity_test_one') to get
+   ## strict shell options (set -e, pipefail, nounset), colored output, and
+   ## shared verification logic with the main repo check.
+   sq_git_trust_root=HEAD \
+      git submodule foreach --recursive \
+         'bash "$toplevel/help-steps/git_sanity_test_one" "$displaypath"'
 }
 
 git_sanity_test_check_for_untagged_commits() {

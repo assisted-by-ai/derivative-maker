@@ -1,0 +1,64 @@
+#!/bin/bash
+
+## Copyright (C) 2012 - 2025 ENCRYPTED SUPPORT LLC <adrelanos@whonix.org>
+## See the file COPYING for copying conditions.
+
+## Verifies a single git repository: signature, tag status, uncommitted changes.
+## Used for both the main repo and each submodule (called via
+## 'git submodule foreach --recursive').
+##
+## Environment variables (must be exported by caller):
+##   sq_git_policy_file          - path to openpgp-policy.toml
+##   sq_git_trust_root           - trust root for sq-git log (default: HEAD)
+##   dist_build_ignore_untagged  - "true" to skip untagged check
+##   dist_build_ignore_uncommitted - "true" to skip uncommitted check
+##
+## Arguments:
+##   $1  - context label for error messages (e.g. "main repo" or submodule displaypath)
+
+set -e
+set -o pipefail
+set -o nounset
+
+MYDIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )" && pwd )"
+
+source "$MYDIR/colors"
+colors
+
+context="${1:-unknown}"
+trust_root="${sq_git_trust_root:-HEAD}"
+
+head="$(git rev-parse HEAD)" || { echo "${bold}${red}ERROR: Failed to get HEAD for: ${context}${reset}"; exit 1; }
+
+## 1. Signature verification using sq-git with parent repo's policy file.
+## The parent repo's openpgp-policy.toml is used for all repositories
+## (main and submodules), keeping signing policy centralized.
+## Submodules always use '--trust-root HEAD': the parent repo (already
+## verified) pins each submodule commit, so we only need to confirm
+## each HEAD is signed by an authorized key.
+if ! sq-git log --policy-file "${sq_git_policy_file}" --trust-root "${trust_root}" -- "${head}^{commit}"; then
+   echo "${bold}${red}ERROR: sq-git signature verification failed for: ${context}${reset}"
+   exit 1
+fi
+
+## 2. Untagged commit check.
+if ! git describe --exact-match --tags HEAD >/dev/null 2>&1; then
+   if [ "${dist_build_ignore_untagged:-}" = "true" ]; then
+      echo "${cyan}INFO: Untagged commit in ${context}, but --allow-untagged is set, continuing.${reset}"
+   else
+      echo "${bold}${red}ERROR: Untagged commit in: ${context}${reset}"
+      exit 1
+   fi
+fi
+
+## 3. Uncommitted changes check.
+git_status="$(git status --porcelain=v1 2>&1)"
+if [ -n "$git_status" ]; then
+   if [ "${dist_build_ignore_uncommitted:-}" = "true" ]; then
+      echo "${cyan}INFO: Uncommitted changes in ${context}, but --allow-uncommitted is set, continuing.${reset}"
+   else
+      echo "${bold}${red}ERROR: Uncommitted changes in: ${context}${reset}"
+      git status
+      exit 1
+   fi
+fi
