@@ -110,6 +110,11 @@ git_sanity_test_submodules() {
    ## Using a separate bash helper script ('git_sanity_test_one') to get
    ## strict shell options (set -e, pipefail, nounset), colored output, and
    ## shared verification logic with the main repo check.
+   ##
+   ## '$toplevel' is safe for nested submodules: git sets it via xgetcwd()
+   ## at foreach start, so it always points to the root superproject.
+   ## https://github.com/git/git/blob/master/builtin/submodule--helper.c
+   ## (function runcommand_in_submodule_cb: toplevel = xgetcwd())
    sq_git_trust_root=HEAD \
       git submodule foreach --recursive \
          'bash "$toplevel/help-steps/git_sanity_test_one" "$displaypath"'
