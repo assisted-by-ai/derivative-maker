@@ -218,11 +218,19 @@ if [ -z "${sq_git_policy_file:-}" ]; then
    source "$MYDIR/variables"
 elif [ "${#forwarded_args[@]}" -gt 0 ]; then
    ## Build-context invocation: env vars are already set, but the user
-   ## passed extra args meant for parse-cmd. Warn that they will be
-   ## ignored - the parent build context's parse-cmd run already set
-   ## the env vars and we cannot re-run parse-cmd here without sourcing
-   ## the build infrastructure (which would change cwd).
-   echo "${0##*/}: WARNING: ignoring extra args (env vars already set by parent build context): ${forwarded_args[*]}" >&2
+   ## passed extra args meant for parse-cmd. We cannot re-run parse-cmd
+   ## here without re-sourcing the build infrastructure (which would
+   ## change cwd and break the recursive submodule case). Erroring out
+   ## is the safe choice: the user expected the args to take effect,
+   ## but they would not.
+   ##
+   ## To pass --allow-untagged / --allow-uncommitted etc. through to
+   ## git_sanity_test, set them on the parent build invocation
+   ## (e.g. 'derivative-update --allow-untagged true ...') so they are
+   ## propagated as env vars.
+   printf '%s\n' "${0##*/}: ERROR: extra args cannot be honoured in build context (env vars already set by parent): ${forwarded_args[*]}" >&2
+   printf '%s\n' "${0##*/}:        pass --allow-untagged / --allow-uncommitted etc. on the parent build invocation instead." >&2
+   exit 1
 fi
 
 ## ----------------------------------------------------------------------------
