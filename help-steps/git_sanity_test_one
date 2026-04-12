@@ -3,74 +3,213 @@
 ## Copyright (C) 2012 - 2025 ENCRYPTED SUPPORT LLC <adrelanos@whonix.org>
 ## See the file COPYING for copying conditions.
 
-## Verifies a single git repository: signature, tag status, uncommitted changes.
-## Used for both the main repo and each submodule (called via
-## 'git submodule foreach --recursive').
+## Single-source git verification tool. Replaces the old bash functions
+## (signed_by_fingerprint, verify_ref, git_sanity_test_main, etc.) that
+## previously lived in 'help-steps/git_sanity_test'.
 ##
-## Environment variables (must be exported by caller):
-##   sq_git_policy_file            - path to openpgp-policy.toml
-##   sq_git_trust_root             - trust root for sq-git log (default: HEAD)
-##   dist_build_ignore_untagged    - "true" to skip untagged check
-##   dist_build_ignore_uncommitted - "true" to skip uncommitted check
+## Modes (--mode is REQUIRED, no default):
 ##
-## Arguments:
-##   $1  - context label for error messages (e.g. "main repo" or submodule displaypath)
+##   working-tree --context LABEL
+##     Verify the current working directory's git repo:
+##       1. sq-git signature on HEAD commit
+##       2. sq-git signature on the tag object (if HEAD is an exact tag)
+##       3. untagged commit check
+##       4. uncommitted changes check
+##     Exit codes: 0=ok, 1=signature, 2=untagged, 3=uncommitted
 ##
-## Exit codes:
-##   0  - all checks passed
-##   1  - signature verification failed
-##   2  - untagged commit
-##   3  - uncommitted changes
+##   ref --ref REF --ref-type {tag|commit}
+##     Verify a specific ref's signature(s) only.
+##       - Always checks the commit signature.
+##       - For --ref-type tag, also checks the tag object signature.
+##     Exit codes: 0=ok, 1=verification failed
+##
+##   submodules
+##     Recursively run 'working-tree' on every submodule via
+##     'git submodule foreach --recursive'. Submodules use --trust-root HEAD
+##     because the parent repo (already verified) pins each submodule commit.
+##     Exit codes: 0=ok, non-zero=at least one submodule failed
+##
+##   all --context LABEL
+##     'working-tree' on cwd, then 'submodules'.
+##
+## Environment variables:
+##   sq_git_policy_file              REQUIRED. Path to openpgp-policy.toml.
+##   sq_git_trust_root               Default: HEAD.
+##   dist_build_ignore_untagged      "true" to skip untagged check.
+##   dist_build_ignore_uncommitted   "true" to skip uncommitted check.
+##   dist_source_help_steps_folder   Used for cleanup-files hint path (optional).
 
 set -e
 set -o pipefail
-set -o nounset
 
 MYDIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )" && pwd )"
 
+## Source 'colors' before enabling nounset; the colors script has an
+## unguarded read of '$dist_build_already_defined_colors' that would fail
+## under 'set -o nounset'.
+## The 'colors' function early-returns when TERM is empty (e.g. CI, redirected
+## output), leaving the color/format variables unset. Default them to empty
+## strings so 'set -o nounset' below does not trip.
+dist_build_already_defined_colors="${dist_build_already_defined_colors:-}"
 source "$MYDIR/colors"
 colors
+: "${bold:=}" "${red:=}" "${cyan:=}" "${under:=}" "${eunder:=}" "${reset:=}"
 
-context="${1:-unknown}"
+set -o nounset
+
+die() {
+   printf '%s\n' "${bold}${red}${0##*/}: ERROR: $*${reset}" >&2
+   exit 1
+}
+
+mode=""
+context=""
+ref=""
+ref_type=""
+
+while [ $# -gt 0 ]; do
+   case "$1" in
+      --mode)     mode="${2:-}";     shift 2 ;;
+      --context)  context="${2:-}";  shift 2 ;;
+      --ref)      ref="${2:-}";      shift 2 ;;
+      --ref-type) ref_type="${2:-}"; shift 2 ;;
+      --help|-h)
+         sed -n 's/^## \{0,1\}//p' "$0" | head -n 40
+         exit 0
+         ;;
+      *) die "unknown option: $1" ;;
+   esac
+done
+
+[ -n "$mode" ] || die "--mode is required (working-tree | ref | submodules | all)"
+[ -n "${sq_git_policy_file:-}" ] || die "sq_git_policy_file env var must be set"
 trust_root="${sq_git_trust_root:-HEAD}"
 
-head="$(git rev-parse HEAD)" || { echo "${bold}${red}ERROR: Failed to get HEAD for: ${context}${reset}"; exit 1; }
-
-## 1. Signature verification using sq-git with the policy file.
-## The parent repo's openpgp-policy.toml is used for all repositories
-## (main and submodules), keeping signing policy centralized.
-if ! sq-git log --policy-file "${sq_git_policy_file}" --trust-root "${trust_root}" -- "${head}^{commit}"; then
-   echo "${bold}${red}ERROR: sq-git signature verification failed for: ${context}${reset}"
-   exit 1
-fi
-
-## If HEAD is an exact tag, also verify the tag object signature.
-git_tag_exact="$(git describe --exact-match --tags HEAD 2>/dev/null)" || true
-if [ -n "${git_tag_exact}" ]; then
-   if ! sq-git log --policy-file "${sq_git_policy_file}" --trust-root "${trust_root}" -- "${git_tag_exact}"; then
-      echo "${bold}${red}ERROR: sq-git tag signature verification failed for tag '${git_tag_exact}' in: ${context}${reset}"
-      exit 1
+## sq-git allows offloading the complexity of OpenPGP signing key import.
+## File 'openpgp-policy.toml' contains authorized signing key(s) and supports
+## multiple authorized signers natively.
+sq_git_verify() {
+   local target="$1"
+   local label="$2"
+   if sq-git log --policy-file "${sq_git_policy_file}" --trust-root "${trust_root}" -- "${target}"; then
+      true "INFO: sq-git verification ok: ${label}"
+      return 0
    fi
-fi
+   echo "${bold}${red}ERROR: sq-git verification failed: ${label}${reset}" >&2
+   echo "${cyan}INFO: If this is intentional, configure your own sq-git policy file." >&2
+   echo "${cyan}      See 'buildconfig.d/30_signing_key.conf'.${reset}" >&2
+   return 1
+}
 
-## 2. Untagged commit check.
-if [ -z "${git_tag_exact}" ]; then
-   if [ "${dist_build_ignore_untagged:-}" = "true" ]; then
-      echo "${cyan}INFO: Untagged commit in ${context}, but --allow-untagged is set, continuing.${reset}"
-   else
-      echo "${bold}${red}ERROR: Untagged commit in: ${context}${reset}"
-      exit 2
-   fi
-fi
+print_allow_hint() {
+   echo "${cyan}INFO: As a developer or advanced user you might want to use:" >&2
+   echo "${under}WARNING:${eunder} This can be ${under}insecure${eunder} if you cannot audit the changes." >&2
+   echo "${bold}${under}--allow-untagged true${eunder} ${under}--allow-uncommitted true${eunder}${reset}" >&2
+}
 
-## 3. Uncommitted changes check.
-git_status="$(git status --porcelain=v1 2>&1)"
-if [ -n "$git_status" ]; then
-   if [ "${dist_build_ignore_uncommitted:-}" = "true" ]; then
-      echo "${cyan}INFO: Uncommitted changes in ${context}, but --allow-uncommitted is set, continuing.${reset}"
-   else
-      echo "${bold}${red}ERROR: Uncommitted changes in: ${context}${reset}"
-      git status
-      exit 3
+mode_working_tree() {
+   [ -n "$context" ] || die "--context is required for --mode working-tree"
+
+   local head git_tag_exact git_status
+
+   head="$(git rev-parse HEAD)" || die "Failed to get HEAD for: ${context}"
+
+   ## 1. Commit signature.
+   sq_git_verify "${head}^{commit}" "${context} (commit ${head})" || exit 1
+
+   ## If HEAD is an exact tag, also verify the tag object signature.
+   ## Policy: All git tags are always signed.
+   git_tag_exact="$(git describe --exact-match --tags HEAD 2>/dev/null)" || true
+   if [ -n "${git_tag_exact}" ]; then
+      sq_git_verify "${git_tag_exact}" "${context} tag '${git_tag_exact}'" || exit 1
    fi
-fi
+
+   ## 2. Untagged commit check.
+   if [ -z "${git_tag_exact}" ]; then
+      if [ "${dist_build_ignore_untagged:-}" = "true" ]; then
+         echo "${cyan}INFO: Untagged commit in ${context}, --allow-untagged set, continuing.${reset}"
+      else
+         echo "${bold}${red}ERROR: Untagged commit in: ${context}${reset}" >&2
+         print_allow_hint
+         echo "${cyan}INFO: See build documentation on how to verify and checkout git tags.${reset}" >&2
+         exit 2
+      fi
+   fi
+
+   ## 3. Uncommitted changes check.
+   git_status="$(git status --porcelain=v1 2>&1)"
+   if [ -n "$git_status" ]; then
+      if [ "${dist_build_ignore_uncommitted:-}" = "true" ]; then
+         echo "${cyan}INFO: Uncommitted changes in ${context}, --allow-uncommitted set, continuing.${reset}"
+         git status
+      else
+         echo "${bold}${red}ERROR: Uncommitted changes in: ${context}${reset}" >&2
+         git status >&2
+         print_allow_hint
+         echo "${cyan}INFO: Running 'git clean -d --force --force --dry-run' for your convenience:${reset}" >&2
+         git clean -d --force --force --dry-run >&2 || true
+         if [ -n "${dist_source_help_steps_folder:-}" ]; then
+            echo "${cyan}You most likely like to run:${reset}" >&2
+            echo "${under}${dist_source_help_steps_folder}/cleanup-files${eunder}" >&2
+            echo "${cyan}or if you know what you are doing:${reset}" >&2
+            echo "${under}git clean -d --force --force${eunder}" >&2
+            echo "${under}git reset --hard${eunder}" >&2
+         fi
+         exit 3
+      fi
+   fi
+}
+
+mode_ref() {
+   [ -n "$ref" ]      || die "--ref is required for --mode ref"
+   [ -n "$ref_type" ] || die "--ref-type is required for --mode ref"
+   case "$ref_type" in
+      tag|commit) ;;
+      *) die "--ref-type must be 'tag' or 'commit'" ;;
+   esac
+
+   ## Always verify the commit signature.
+   sq_git_verify "${ref}^{commit}" "ref '${ref}' (commit)" || exit 1
+
+   ## For tags, also verify the tag object signature.
+   ## NOTE: Not using 'refs/tags/' prefix here. The caller is responsible for
+   ## passing an unambiguous ref. sq-git resolves it via the local repo.
+   if [ "$ref_type" = 'tag' ]; then
+      sq_git_verify "${ref}" "ref '${ref}' (tag object)" || exit 1
+   fi
+}
+
+mode_submodules() {
+   ## Comprehensive submodule checks via 'git submodule foreach --recursive'.
+   ## Handles nested submodules, paths with special characters, moved paths.
+   ##
+   ## Submodule repositories intentionally do not include their own 'sq-git'
+   ## policy file ('openpgp-policy.toml'). The parent repo's policy file is
+   ## used for all verification, keeping signing policy centralized.
+   ##
+   ## NOTE: 'git submodule foreach' runs commands under /bin/sh, not bash.
+   ## We re-invoke this script (under bash) per submodule to keep strict
+   ## shell options and shared verification logic.
+   ##
+   ## '$toplevel' is safe for nested submodules: git sets it via xgetcwd()
+   ## at foreach start, so it always points to the root superproject.
+   ## https://github.com/git/git/blob/master/builtin/submodule--helper.c
+   ## (function runcommand_in_submodule_cb: toplevel = xgetcwd())
+   sq_git_trust_root=HEAD \
+      git submodule foreach --recursive \
+         'bash "$toplevel/help-steps/git_sanity_test_one" --mode working-tree --context "$displaypath"'
+}
+
+mode_all() {
+   [ -n "$context" ] || die "--context is required for --mode all"
+   mode_working_tree
+   mode_submodules
+}
+
+case "$mode" in
+   working-tree) mode_working_tree ;;
+   ref)          mode_ref ;;
+   submodules)   mode_submodules ;;
+   all)          mode_all ;;
+   *) die "unknown mode '$mode' (working-tree | ref | submodules | all)" ;;
+esac

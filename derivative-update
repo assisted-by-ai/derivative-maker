@@ -20,7 +20,9 @@ source ./help-steps/pre
 source ./help-steps/colors
 source ./help-steps/variables
 
-source ./help-steps/git_sanity_test
+## Path to the unified git verification helper. All git verification
+## (main repo + submodules + arbitrary refs) goes through this script.
+git_sanity_test_one="${dist_source_help_steps_folder}/git_sanity_test_one"
 
 error_handler_dist_build_one() {
    true "${red}${bold}ERROR in $0${reset}"
@@ -98,14 +100,16 @@ update_repo() {
   ## We need there to be no uncommitted changes in order to robustly verify the repository state.
   ## If there are uncommitted changes, stop.
   ## (Except if using '--allow-uncommitted true'.)
-  ## This also performs digital signature (OpenPGP) verification of the current git HEAD.
-  git_sanity_test_main "$@"
+  ## This also performs digital signature (OpenPGP) verification of the current git HEAD,
+  ## and recursively verifies all submodules.
+  "${git_sanity_test_one}" --mode all --context "main repo"
 
   true "INFO: $BASH_SOURCE continuing..."
 
   if [ "$update_only" = "true" ]; then
-    ## Variable 'git_tag_exact' is set in 'git_sanity_test'.
-    target_tag="$git_tag_exact"
+    ## --update-only requires HEAD to be on an exact tag. (The signature
+    ## of HEAD and the tag itself were already verified above.)
+    target_tag="$(git describe --exact-match --tags HEAD 2>/dev/null)" || target_tag=""
     if [ -z "${target_tag}" ]; then
       error '--update-only used, but no tag was checked out in advance!'
     fi
@@ -126,7 +130,7 @@ update_repo() {
 
   ## Verify the specified ref, then check out that ref.
   if [ -n "${target_tag}" ]; then
-    if ! verify_ref "${target_tag}" 'tag'; then
+    if ! "${git_sanity_test_one}" --mode ref --ref "${target_tag}" --ref-type tag; then
       abort_update 'Tag verification failed!'
     fi
 
@@ -151,18 +155,18 @@ update_repo() {
     ## interface (gpg.openpgp.program / sq-git-wrapper) cannot perform
     ## policy-based verification because git only passes raw signature data,
     ## not the commit ref that 'sq-git log' needs.
-    ## Instead, 'git_sanity_test_submodules' verifies each submodule commit
-    ## directly via 'sq-git log' after the update completes.
+    ## Instead, 'git_sanity_test_one --mode submodules' verifies each submodule
+    ## commit directly via 'sq-git log' after the update completes.
     #"${git_verify_command_wrapper[@]}" -c merge.verifySignatures=true submodule update --init --recursive --jobs=200 --merge \
     git submodule update --init --recursive --jobs=200 --merge \
       || abort_update \
         'Submodule update failed!' \
         "${dist_build_current_git_head}"
 
-    git_sanity_test_submodules
+    "${git_sanity_test_one}" --mode submodules
 
   elif [ -n "${target_ref}" ]; then
-    if ! verify_ref "${target_ref}" 'commit'; then
+    if ! "${git_sanity_test_one}" --mode ref --ref "${target_ref}" --ref-type commit; then
       abort_update 'Ref verification failed!'
     fi
 
@@ -224,7 +228,7 @@ update_repo() {
       ## NOTE: Not using 'refs/remotes/' here because we want to verify the
       ## state of the locally checked-out-and-updated branch, not the remote
       ## branch.
-      verify_ref "${target_ref}" 'commit' \
+      "${git_sanity_test_one}" --mode ref --ref "${target_ref}" --ref-type commit \
         || abort_update \
           'Remote commit verification failed! You are now in detached HEAD state, you will need to check out a branch you trust manually.' \
           "${dist_build_current_git_head}" "${branch_reset_commit}"
@@ -237,8 +241,8 @@ update_repo() {
         || abort_update \
           'Submodule update failed!' \
           "${dist_build_current_git_head}" "${branch_reset_commit}"
-      git_sanity_test_submodules
-      verify_ref "${target_ref}" 'commit' \
+      "${git_sanity_test_one}" --mode submodules
+      "${git_sanity_test_one}" --mode ref --ref "${target_ref}" --ref-type commit \
         || abort_update \
           'Verification failed after submodule update!' \
           "${dist_build_current_git_head}" "${branch_reset_commit}"
