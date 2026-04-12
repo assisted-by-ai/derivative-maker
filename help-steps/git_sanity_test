@@ -156,21 +156,17 @@ esac
 ## submodule. Skipping the sourcing in that case (env vars are already
 ## inherited from the parent) preserves the cwd.
 ##
-## We clear positional parameters with 'set --' before sourcing because
-## 'help-steps/variables' calls 'help-steps/parse-cmd' transitively, and
-## parse-cmd would reject our --mode/--context/--ref arguments as unknown
-## options (parse-cmd processes the build-step argument vocabulary, not
-## ours).
-##
-## 'dist_build_internal_run="true"' tells parse-cmd to accept being
-## invoked with zero arguments (otherwise it errors out).
+## 'dist_build_one_parsed="true"' tells 'help-steps/variables' to skip
+## calling 'help-steps/parse-cmd'. We have our own argument parser
+## (--mode/--context/--ref/--ref-type) above; parse-cmd would reject
+## these as unknown options because it processes the build-step
+## argument vocabulary, not ours.
 ##
 ## NOTE: 'pre' disables 'set -e' and installs ERR/EXIT traps for build-step
 ## error handling. Our explicit 'exit N' calls still propagate via pre's
 ## EXIT trap. Unexpected command failures are caught by pre's ERR trap.
 if [ -z "${sq_git_policy_file:-}" ]; then
-   set --
-   dist_build_internal_run="true"
+   dist_build_one_parsed="true"
    source "$MYDIR/pre"
    source "$MYDIR/colors"
    source "$MYDIR/variables"
