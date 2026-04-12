@@ -124,10 +124,13 @@ MYDIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )" && pwd )"
 ##     duplicating parse-cmd's argument vocabulary in this script.
 ##
 ## NOTE: Forwarding only takes effect during the standalone bootstrap, i.e.
-## when env vars are not yet set. When invoked from a build context (env
-## vars already exported and inherited from the parent), the parent's
-## parse-cmd invocation has already populated the env vars; passing
-## --allow-* directly to this script in that situation has no effect.
+## when the build infrastructure has not yet been set up in a parent. When
+## invoked from a build context (parent already sourced variables+parse-cmd
+## and exported the relevant env vars), passing forwarded args directly to
+## this script is a hard error - re-running parse-cmd here would require
+## re-sourcing variables, which would change cwd and break recursive
+## submodule verification. Set --allow-* on the parent build invocation
+## instead (e.g. 'derivative-update --allow-untagged true ...').
 
 mode=""
 context=""
@@ -365,6 +368,14 @@ mode_working_tree() {
    ## We additionally pass '${git_tag_exact}^{tag}' to force tag-object
    ## resolution: this is a belt-and-suspenders guard that errors out if
    ## for any reason the ref resolves to a non-tag object.
+   ##
+   ## Policy scope: if multiple annotated tags point at HEAD, this
+   ## verifies ONE of them (whichever 'git describe' picks - typically
+   ## the most recent). This matches the intended policy "the checked-
+   ## out release tag must be signed and exact", not "every annotated
+   ## tag at this commit must satisfy policy". If the latter is ever
+   ## needed, replace 'git describe --exact-match' with a loop over
+   ## 'git tag --points-at HEAD' filtered by 'git cat-file -t = tag'.
    git_tag_exact="$(git describe --exact-match HEAD 2>/dev/null)" || true
    if [ -n "${git_tag_exact}" ]; then
       sq_git_verify "${git_tag_exact}^{tag}" "${context} tag '${git_tag_exact}'" || exit 1
