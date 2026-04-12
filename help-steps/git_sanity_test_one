@@ -32,12 +32,35 @@
 ##   all --context LABEL
 ##     'working-tree' on cwd, then 'submodules'.
 ##
-## Environment variables:
-##   sq_git_policy_file              REQUIRED. Path to openpgp-policy.toml.
-##   sq_git_trust_root               Default: HEAD.
-##   dist_build_ignore_untagged      "true" to skip untagged check.
-##   dist_build_ignore_uncommitted   "true" to skip uncommitted check.
-##   dist_source_help_steps_folder   Used for cleanup-files hint path (optional).
+## Environment variables (all REQUIRED for security; no implicit defaults):
+##
+##   sq_git_policy_file
+##     REQUIRED. Absolute path to the openpgp-policy.toml policy file.
+##     Set in 'help-steps/variables'.
+##
+##   sq_git_trust_root
+##     REQUIRED. Trust root for 'sq-git log --trust-root'. Caller must
+##     decide explicitly. 'help-steps/variables' sets this based on build
+##     mode (HEAD for CI / non-redistributable, a fixed commit hash for
+##     redistributable builds). For --mode submodules, this script
+##     internally overrides to "HEAD" because the parent repo (already
+##     verified) pins each submodule commit.
+##
+##   dist_build_ignore_untagged
+##     REQUIRED. "true" or "false". Whether to skip the untagged check.
+##     Set by 'help-steps/parse-cmd' from --allow-untagged; defaulted to
+##     "false" by 'help-steps/variables' otherwise.
+##
+##   dist_build_ignore_uncommitted
+##     REQUIRED. "true" or "false". Whether to skip the uncommitted check.
+##     Set by 'help-steps/parse-cmd' from --allow-uncommitted; defaulted to
+##     "false" by 'help-steps/variables' otherwise.
+##
+## Optional environment variables:
+##
+##   dist_source_help_steps_folder
+##     Used only to print a 'cleanup-files' hint on uncommitted-changes
+##     failure. If unset, the hint is omitted.
 
 set -e
 set -o pipefail
@@ -82,8 +105,25 @@ while [ $# -gt 0 ]; do
 done
 
 [ -n "$mode" ] || die "--mode is required (working-tree | ref | submodules | all)"
-[ -n "${sq_git_policy_file:-}" ] || die "sq_git_policy_file env var must be set"
-trust_root="${sq_git_trust_root:-HEAD}"
+
+## All security-relevant env vars are REQUIRED. No implicit defaults: the
+## caller must make an explicit decision. 'help-steps/variables' sets all
+## of these.
+[ -n "${sq_git_policy_file:-}" ]            || die "env var sq_git_policy_file must be set"
+[ -n "${sq_git_trust_root:-}" ]             || die "env var sq_git_trust_root must be set"
+[ -n "${dist_build_ignore_untagged:-}" ]    || die "env var dist_build_ignore_untagged must be set ('true' or 'false')"
+[ -n "${dist_build_ignore_uncommitted:-}" ] || die "env var dist_build_ignore_uncommitted must be set ('true' or 'false')"
+
+case "${dist_build_ignore_untagged}" in
+   true|false) ;;
+   *) die "dist_build_ignore_untagged must be 'true' or 'false', got: '${dist_build_ignore_untagged}'" ;;
+esac
+case "${dist_build_ignore_uncommitted}" in
+   true|false) ;;
+   *) die "dist_build_ignore_uncommitted must be 'true' or 'false', got: '${dist_build_ignore_uncommitted}'" ;;
+esac
+
+trust_root="${sq_git_trust_root}"
 
 ## sq-git allows offloading the complexity of OpenPGP signing key import.
 ## File 'openpgp-policy.toml' contains authorized signing key(s) and supports
@@ -126,7 +166,7 @@ mode_working_tree() {
 
    ## 2. Untagged commit check.
    if [ -z "${git_tag_exact}" ]; then
-      if [ "${dist_build_ignore_untagged:-}" = "true" ]; then
+      if [ "${dist_build_ignore_untagged}" = "true" ]; then
          echo "${cyan}INFO: Untagged commit in ${context}, --allow-untagged set, continuing.${reset}"
       else
          echo "${bold}${red}ERROR: Untagged commit in: ${context}${reset}" >&2
@@ -139,7 +179,7 @@ mode_working_tree() {
    ## 3. Uncommitted changes check.
    git_status="$(git status --porcelain=v1 2>&1)"
    if [ -n "$git_status" ]; then
-      if [ "${dist_build_ignore_uncommitted:-}" = "true" ]; then
+      if [ "${dist_build_ignore_uncommitted}" = "true" ]; then
          echo "${cyan}INFO: Uncommitted changes in ${context}, --allow-uncommitted set, continuing.${reset}"
          git status
       else
