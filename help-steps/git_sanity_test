@@ -41,6 +41,14 @@
 ##     because the parent repo (already verified) pins each submodule commit.
 ##     Exit codes: 0=ok, non-zero=at least one submodule failed
 ##
+##   --allow-untagged {true|false}
+##     Override 'dist_build_ignore_untagged' for this invocation.
+##     'true' skips the untagged-commit check.
+##
+##   --allow-uncommitted {true|false}
+##     Override 'dist_build_ignore_uncommitted' for this invocation.
+##     'true' skips the uncommitted-changes check.
+##
 ##   --help, -h
 ##     Print this usage information and exit.
 ##
@@ -113,13 +121,38 @@ print_help() {
    ' "$0"
 }
 
+## Override values for the dist_build_ignore_* env vars when passed on the
+## command line. Empty string means "do not override" (use env var as-is).
+allow_untagged_arg=""
+allow_uncommitted_arg=""
+
+validate_bool_arg() {
+   case "$2" in
+      true|false) ;;
+      *)
+         printf '%s\n' "${0##*/}: ERROR: $1 must be 'true' or 'false', got: '$2'" >&2
+         exit 1
+         ;;
+   esac
+}
+
 while [ $# -gt 0 ]; do
    case "$1" in
-      --mode)     mode="${2:-}";     shift 2 ;;
-      --context)  context="${2:-}";  shift 2 ;;
-      --ref)      ref="${2:-}";      shift 2 ;;
-      --ref-type) ref_type="${2:-}"; shift 2 ;;
-      --help|-h)  print_help; exit 0 ;;
+      --mode)             mode="${2:-}";     shift 2 ;;
+      --context)          context="${2:-}";  shift 2 ;;
+      --ref)              ref="${2:-}";      shift 2 ;;
+      --ref-type)         ref_type="${2:-}"; shift 2 ;;
+      --allow-untagged)
+         validate_bool_arg "$1" "${2:-}"
+         allow_untagged_arg="$2"
+         shift 2
+         ;;
+      --allow-uncommitted)
+         validate_bool_arg "$1" "${2:-}"
+         allow_uncommitted_arg="$2"
+         shift 2
+         ;;
+      --help|-h)          print_help; exit 0 ;;
       *)
          printf '%s\n' "${0##*/}: ERROR: unknown option: $1" >&2
          exit 1
@@ -189,6 +222,15 @@ die() {
    printf '%s\n' "${bold}${red}${0##*/}: ERROR: $*${reset}" >&2
    exit 1
 }
+
+## ----------------------------------------------------------------------------
+## Apply --allow-untagged / --allow-uncommitted command-line overrides.
+## These take precedence over whatever 'help-steps/parse-cmd' (called from
+## a parent build context) or 'help-steps/variables' (defaulted to "false")
+## previously set the env vars to.
+## ----------------------------------------------------------------------------
+[ -z "$allow_untagged_arg" ]    || dist_build_ignore_untagged="$allow_untagged_arg"
+[ -z "$allow_uncommitted_arg" ] || dist_build_ignore_uncommitted="$allow_uncommitted_arg"
 
 ## ----------------------------------------------------------------------------
 ## Env var validation (all REQUIRED, no implicit defaults)
