@@ -141,31 +141,40 @@ esac
 ## ----------------------------------------------------------------------------
 ##
 ## When invoked from 'derivative-update' or 'build-steps.d/1100_sanity-tests',
-## the build infrastructure has already been sourced and the env vars are set.
-## When invoked directly by a developer, the env vars are unset; we source
-## 'pre', 'colors', and 'variables' to populate them - the same scripts the
-## normal callers source.
+## the build infrastructure has already been sourced and the env vars are
+## inherited (because they are exported). When invoked directly by a
+## developer, the env vars are unset; we source 'pre', 'colors', and
+## 'variables' here to populate them - the same scripts the normal callers
+## source.
 ##
-## Sourcing happens inside a function so '$@' is empty when 'parse-cmd' is
-## called transitively from 'variables' (parse-cmd would otherwise complain
-## about our --mode/--context/--ref args being unknown options).
+## Why conditional (and not the standard help-steps unconditional pattern):
+## sourcing 'help-steps/variables' executes 'cd "$source_code_folder_dist"'
+## (variables line ~121), which moves the cwd to the main repo. When this
+## script is invoked recursively via 'git submodule foreach' (--mode
+## submodules below), the cwd is the submodule directory and must stay
+## there for 'git rev-parse HEAD' / 'git status' to operate on the
+## submodule. Skipping the sourcing in that case (env vars are already
+## inherited from the parent) preserves the cwd.
+##
+## We clear positional parameters with 'set --' before sourcing because
+## 'help-steps/variables' calls 'help-steps/parse-cmd' transitively, and
+## parse-cmd would reject our --mode/--context/--ref arguments as unknown
+## options (parse-cmd processes the build-step argument vocabulary, not
+## ours).
+##
+## 'dist_build_internal_run="true"' tells parse-cmd to accept being
+## invoked with zero arguments (otherwise it errors out).
 ##
 ## NOTE: 'pre' disables 'set -e' and installs ERR/EXIT traps for build-step
 ## error handling. Our explicit 'exit N' calls still propagate via pre's
 ## EXIT trap. Unexpected command failures are caught by pre's ERR trap.
-maybe_source_build_infrastructure() {
-   if [ -n "${sq_git_policy_file:-}" ]; then
-      return 0
-   fi
-   ## $@ is empty inside this function (called with no args), so 'parse-cmd'
-   ## (transitively sourced by 'variables') sees no positional parameters.
-   ## 'dist_build_internal_run=true' tells parse-cmd to accept zero args.
+if [ -z "${sq_git_policy_file:-}" ]; then
+   set --
    dist_build_internal_run="true"
    source "$MYDIR/pre"
    source "$MYDIR/colors"
    source "$MYDIR/variables"
-}
-maybe_source_build_infrastructure
+fi
 
 ## ----------------------------------------------------------------------------
 ## Colors
