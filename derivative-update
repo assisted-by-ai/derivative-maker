@@ -22,7 +22,7 @@ source ./help-steps/variables
 
 ## Path to the unified git verification helper. All git verification
 ## (main repo + submodules + arbitrary refs) goes through this script.
-git_sanity_test_one="${dist_source_help_steps_folder}/git_sanity_test_one"
+git_sanity_test="${dist_source_help_steps_folder}/git_sanity_test"
 
 error_handler_dist_build_one() {
    true "${red}${bold}ERROR in $0${reset}"
@@ -102,7 +102,7 @@ update_repo() {
   ## (Except if using '--allow-uncommitted true'.)
   ## This also performs digital signature (OpenPGP) verification of the current git HEAD,
   ## and recursively verifies all submodules.
-  "${git_sanity_test_one}" --mode all --context "main repo"
+  "${git_sanity_test}" --mode all --context "main repo"
 
   true "INFO: $BASH_SOURCE continuing..."
 
@@ -130,7 +130,7 @@ update_repo() {
 
   ## Verify the specified ref, then check out that ref.
   if [ -n "${target_tag}" ]; then
-    if ! "${git_sanity_test_one}" --mode ref --ref "${target_tag}" --ref-type tag; then
+    if ! "${git_sanity_test}" --mode ref --ref "${target_tag}" --ref-type tag; then
       abort_update 'Tag verification failed!'
     fi
 
@@ -155,7 +155,7 @@ update_repo() {
     ## interface (gpg.openpgp.program / sq-git-wrapper) cannot perform
     ## policy-based verification because git only passes raw signature data,
     ## not the commit ref that 'sq-git log' needs.
-    ## Instead, 'git_sanity_test_one --mode submodules' verifies each submodule
+    ## Instead, 'git_sanity_test --mode submodules' verifies each submodule
     ## commit directly via 'sq-git log' after the update completes.
     #"${git_verify_command_wrapper[@]}" -c merge.verifySignatures=true submodule update --init --recursive --jobs=200 --merge \
     git submodule update --init --recursive --jobs=200 --merge \
@@ -163,10 +163,13 @@ update_repo() {
         'Submodule update failed!' \
         "${dist_build_current_git_head}"
 
-    "${git_sanity_test_one}" --mode submodules
+    "${git_sanity_test}" --mode submodules \
+      || abort_update \
+        'Submodule verification failed!' \
+        "${dist_build_current_git_head}"
 
   elif [ -n "${target_ref}" ]; then
-    if ! "${git_sanity_test_one}" --mode ref --ref "${target_ref}" --ref-type commit; then
+    if ! "${git_sanity_test}" --mode ref --ref "${target_ref}" --ref-type commit; then
       abort_update 'Ref verification failed!'
     fi
 
@@ -228,7 +231,7 @@ update_repo() {
       ## NOTE: Not using 'refs/remotes/' here because we want to verify the
       ## state of the locally checked-out-and-updated branch, not the remote
       ## branch.
-      "${git_sanity_test_one}" --mode ref --ref "${target_ref}" --ref-type commit \
+      "${git_sanity_test}" --mode ref --ref "${target_ref}" --ref-type commit \
         || abort_update \
           'Remote commit verification failed! You are now in detached HEAD state, you will need to check out a branch you trust manually.' \
           "${dist_build_current_git_head}" "${branch_reset_commit}"
@@ -241,8 +244,11 @@ update_repo() {
         || abort_update \
           'Submodule update failed!' \
           "${dist_build_current_git_head}" "${branch_reset_commit}"
-      "${git_sanity_test_one}" --mode submodules
-      "${git_sanity_test_one}" --mode ref --ref "${target_ref}" --ref-type commit \
+      "${git_sanity_test}" --mode submodules \
+        || abort_update \
+          'Submodule verification failed!' \
+          "${dist_build_current_git_head}" "${branch_reset_commit}"
+      "${git_sanity_test}" --mode ref --ref "${target_ref}" --ref-type commit \
         || abort_update \
           'Verification failed after submodule update!' \
           "${dist_build_current_git_head}" "${branch_reset_commit}"

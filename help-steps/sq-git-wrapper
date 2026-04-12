@@ -148,7 +148,7 @@ case "$mode" in
     ## pass the commit hash. Therefore this wrapper cannot call 'sq-git log'
     ## (which needs a commit ref and natively understands openpgp-policy.toml).
     ## Policy-based submodule verification is handled separately by
-    ## 'help-steps/git_sanity_test_one --mode submodules' using
+    ## 'help-steps/git_sanity_test --mode submodules' using
     ## 'sq-git log' directly.
     ##
     ## Not using '--signer-email "$DEBEMAIL"':

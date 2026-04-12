@@ -423,7 +423,7 @@ main() {
    check-copy-vms-into-raw "$@"
    check_required_packages_installed "$@"
 
-   "$dist_source_help_steps_folder/git_sanity_test_one" --mode all --context "main repo"
+   "$dist_source_help_steps_folder/git_sanity_test" --mode all --context "main repo"
 
    true
 }

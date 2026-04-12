@@ -237,7 +237,7 @@ mode_submodules() {
    ## (function runcommand_in_submodule_cb: toplevel = xgetcwd())
    sq_git_trust_root=HEAD \
       git submodule foreach --recursive \
-         'bash "$toplevel/help-steps/git_sanity_test_one" --mode working-tree --context "$displaypath"'
+         'bash "$toplevel/help-steps/git_sanity_test" --mode working-tree --context "$displaypath"'
 }
 
 mode_all() {
