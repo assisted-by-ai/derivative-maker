@@ -358,64 +358,50 @@ mode_working_tree() {
    [ -n "$context" ] || die "--context is required for --mode working-tree"
 
    local head git_status
-   local annotated_tag_count=0
-   local lightweight_tag_list=""
-   local objtype tag_name
+   local -a tags_at_head
 
    head="$(git rev-parse HEAD)" || die "Failed to get HEAD for: ${context}"
 
    ## 1. Commit signature.
    sq_git_verify "${head}^{commit}" "${context} (commit ${head})" || exit 1
 
-   ## 2. Tag signature and tag-presence check.
+   ## 2. Tag check. Policy: a commit has either zero tags or exactly
+   ## one tag, and that tag must be an annotated signed tag.
    ##
-   ## Enumerate EVERY ref under refs/tags that points at HEAD - not just
-   ## whichever one 'git describe --exact-match' would pick - so that a
-   ## co-located unsigned tag cannot slip past the check.
+   ## Rationale for "at most one tag":
+   ## - makes release identity unambiguous (commit X = release Y, not
+   ##   "maybe release Y or maybe release Z")
+   ## - closes the signed-tag bypass where an unsigned second tag on the
+   ##   same commit as a signed release tag would previously slip past
+   ##   'git describe --exact-match'
+   ## - keeps the check trivial: one case split on tag count
    ##
-   ## For each tag:
-   ##   - annotated tag (objecttype=tag): verify the tag object signature
-   ##     via '${tag}^{tag}' (the peel forces tag-object resolution).
-   ##   - lightweight tag (objecttype=commit): cannot carry a signature,
-   ##     so it cannot satisfy the 'all tags must be signed' policy.
-   ##     Treat the same as 'untagged' for --allow-untagged purposes
-   ##     (error out unless the operator explicitly opted in).
-   ##
-   ## A commit with no annotated tag pointing at it is untagged for
-   ## policy purposes, same as before.
-   while IFS=$'\t' read -r objtype tag_name; do
-      [ -n "${tag_name}" ] || continue
-      case "${objtype}" in
-         tag)
-            sq_git_verify "${tag_name}^{tag}" "${context} tag '${tag_name}'" || exit 1
-            annotated_tag_count=$((annotated_tag_count + 1))
-            ;;
-         commit)
-            lightweight_tag_list="${lightweight_tag_list:+${lightweight_tag_list} }${tag_name}"
-            ;;
-      esac
-   done < <(git for-each-ref --points-at=HEAD --format='%(objecttype)%09%(refname:short)' refs/tags)
+   ## Lightweight tag handling is implicit: the '^{tag}' peel below forces
+   ## annotated-tag resolution. A lightweight tag has no tag object, so
+   ## 'sq-git log -- <tag>^{tag}' errors out, which is the correct
+   ## outcome under "all tags must be signed".
+   readarray -t tags_at_head < <(git for-each-ref --points-at=HEAD --format='%(refname:short)' refs/tags)
 
-   if [ -n "${lightweight_tag_list}" ]; then
-      if [ "${dist_build_ignore_untagged}" = "true" ]; then
-         echo "${cyan}INFO: Lightweight (unsignable) tag(s) on ${context}: ${lightweight_tag_list}; --allow-untagged set, continuing.${reset}"
-      else
-         echo "${bold}${red}ERROR: Lightweight (unsignable) tag(s) point at HEAD in ${context}: ${lightweight_tag_list}${reset}" >&2
-         echo "${cyan}INFO: Lightweight tags have no tag object and cannot carry an OpenPGP signature. Under the 'all tags must be signed' policy this is a violation. Remove them, replace with annotated signed tags, or pass --allow-untagged true.${reset}" >&2
+   case "${#tags_at_head[@]}" in
+      0)
+         if [ "${dist_build_ignore_untagged}" = "true" ]; then
+            echo "${cyan}INFO: Untagged commit in ${context}, --allow-untagged set, continuing.${reset}"
+         else
+            echo "${bold}${red}ERROR: Untagged commit in: ${context}${reset}" >&2
+            print_allow_hint
+            echo "${cyan}INFO: See build documentation on how to verify and checkout git tags.${reset}" >&2
+            exit 2
+         fi
+         ;;
+      1)
+         sq_git_verify "${tags_at_head[0]}^{tag}" "${context} tag '${tags_at_head[0]}'" || exit 1
+         ;;
+      *)
+         echo "${bold}${red}ERROR: Multiple tags point at HEAD in ${context}: ${tags_at_head[*]}${reset}" >&2
+         echo "${cyan}INFO: Policy requires at most one tag per commit. Remove the extras before building.${reset}" >&2
          exit 2
-      fi
-   fi
-
-   if [ "${annotated_tag_count}" -eq 0 ]; then
-      if [ "${dist_build_ignore_untagged}" = "true" ]; then
-         echo "${cyan}INFO: Untagged commit in ${context}, --allow-untagged set, continuing.${reset}"
-      else
-         echo "${bold}${red}ERROR: Untagged commit in: ${context}${reset}" >&2
-         print_allow_hint
-         echo "${cyan}INFO: See build documentation on how to verify and checkout git tags.${reset}" >&2
-         exit 2
-      fi
-   fi
+         ;;
+   esac
 
    ## 3. Uncommitted changes check.
    ##
