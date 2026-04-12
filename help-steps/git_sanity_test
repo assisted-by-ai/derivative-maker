@@ -41,16 +41,24 @@
 ##     because the parent repo (already verified) pins each submodule commit.
 ##     Exit codes: 0=ok, non-zero=at least one submodule failed
 ##
-##   --allow-untagged {true|false}
-##     Override 'dist_build_ignore_untagged' for this invocation.
-##     'true' skips the untagged-commit check.
-##
-##   --allow-uncommitted {true|false}
-##     Override 'dist_build_ignore_uncommitted' for this invocation.
-##     'true' skips the uncommitted-changes check.
-##
 ##   --help, -h
 ##     Print this usage information and exit.
+##
+## Forwarded arguments:
+##   Any argument that is not in the script-specific list above
+##   (--mode/--context/--ref/--ref-type/--help) is forwarded to
+##   'help-steps/parse-cmd' via 'help-steps/variables' during the
+##   standalone bootstrap. This is the same parser the build-step
+##   scripts use, so you can pass e.g.:
+##
+##     ./help-steps/git_sanity_test --allow-untagged true
+##     ./help-steps/git_sanity_test --allow-uncommitted true
+##
+##   Forwarding only takes effect when the script is invoked standalone
+##   (env vars not yet set). When invoked from a build context where the
+##   parent has already populated the env vars, forwarded arguments are
+##   ignored with a warning - the parent's parse-cmd run already set the
+##   relevant env vars.
 ##
 ## Environment variables (all REQUIRED for security; no implicit defaults):
 ##
@@ -103,11 +111,26 @@ MYDIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )" && pwd )"
 ## ----------------------------------------------------------------------------
 ## Argument parsing
 ## ----------------------------------------------------------------------------
+##
+## Two layers:
+##  1. Script-specific args (--mode/--context/--ref/--ref-type/--help)
+##     are parsed here and consumed.
+##  2. Anything else (e.g. --allow-untagged true, --allow-uncommitted true,
+##     --debug) is forwarded to 'help-steps/parse-cmd' via 'help-steps/
+##     variables' during the standalone bootstrap below. This avoids
+##     duplicating parse-cmd's argument vocabulary in this script.
+##
+## NOTE: Forwarding only takes effect during the standalone bootstrap, i.e.
+## when env vars are not yet set. When invoked from a build context (env
+## vars already exported and inherited from the parent), the parent's
+## parse-cmd invocation has already populated the env vars; passing
+## --allow-* directly to this script in that situation has no effect.
 
 mode=""
 context=""
 ref=""
 ref_type=""
+forwarded_args=()
 
 print_help() {
    ## Print the leading doc comments (## ...) at the top of this file,
@@ -121,41 +144,25 @@ print_help() {
    ' "$0"
 }
 
-## Override values for the dist_build_ignore_* env vars when passed on the
-## command line. Empty string means "do not override" (use env var as-is).
-allow_untagged_arg=""
-allow_uncommitted_arg=""
-
-validate_bool_arg() {
-   case "$2" in
-      true|false) ;;
-      *)
-         printf '%s\n' "${0##*/}: ERROR: $1 must be 'true' or 'false', got: '$2'" >&2
-         exit 1
-         ;;
-   esac
-}
-
 while [ $# -gt 0 ]; do
    case "$1" in
-      --mode)             mode="${2:-}";     shift 2 ;;
-      --context)          context="${2:-}";  shift 2 ;;
-      --ref)              ref="${2:-}";      shift 2 ;;
-      --ref-type)         ref_type="${2:-}"; shift 2 ;;
-      --allow-untagged)
-         validate_bool_arg "$1" "${2:-}"
-         allow_untagged_arg="$2"
-         shift 2
-         ;;
-      --allow-uncommitted)
-         validate_bool_arg "$1" "${2:-}"
-         allow_uncommitted_arg="$2"
-         shift 2
-         ;;
-      --help|-h)          print_help; exit 0 ;;
+      --mode)      mode="${2:-}";     shift 2 ;;
+      --context)   context="${2:-}";  shift 2 ;;
+      --ref)       ref="${2:-}";      shift 2 ;;
+      --ref-type)  ref_type="${2:-}"; shift 2 ;;
+      --help|-h)   print_help; exit 0 ;;
+      ## Everything else: forward to parse-cmd via the standalone bootstrap.
+      ## Most arguments parse-cmd accepts come in '--name value' pairs;
+      ## we forward both tokens together. Bare flags would also work
+      ## because parse-cmd's case statement consumes its own tokens.
       *)
-         printf '%s\n' "${0##*/}: ERROR: unknown option: $1" >&2
-         exit 1
+         if [ $# -ge 2 ]; then
+            forwarded_args+=("$1" "$2")
+            shift 2
+         else
+            forwarded_args+=("$1")
+            shift
+         fi
          ;;
    esac
 done
@@ -189,20 +196,33 @@ esac
 ## submodule. Skipping the sourcing in that case (env vars are already
 ## inherited from the parent) preserves the cwd.
 ##
-## 'dist_build_one_parsed="true"' tells 'help-steps/variables' to skip
-## calling 'help-steps/parse-cmd'. We have our own argument parser
-## (--mode/--context/--ref/--ref-type) above; parse-cmd would reject
-## these as unknown options because it processes the build-step
-## argument vocabulary, not ours.
+## We forward unrecognized command-line args (e.g. --allow-untagged true,
+## --allow-uncommitted true, --debug) to 'help-steps/parse-cmd' via 'help-
+## steps/variables'. variables sources parse-cmd and calls
+## 'dist_build_one_parse_cmd "$@"' with whatever positional parameters are
+## set when variables is sourced - so we 'set --' to our forwarded_args
+## first. This avoids duplicating parse-cmd's argument parsing here.
+##
+## 'dist_build_internal_run="true"' tells parse-cmd to accept being
+## invoked with zero or unknown args without exiting (it would otherwise
+## reject empty argv as "No option chosen!").
 ##
 ## NOTE: 'pre' disables 'set -e' and installs ERR/EXIT traps for build-step
 ## error handling. Our explicit 'exit N' calls still propagate via pre's
 ## EXIT trap. Unexpected command failures are caught by pre's ERR trap.
 if [ -z "${sq_git_policy_file:-}" ]; then
-   dist_build_one_parsed="true"
+   set -- "${forwarded_args[@]}"
+   dist_build_internal_run="true"
    source "$MYDIR/pre"
    source "$MYDIR/colors"
    source "$MYDIR/variables"
+elif [ "${#forwarded_args[@]}" -gt 0 ]; then
+   ## Build-context invocation: env vars are already set, but the user
+   ## passed extra args meant for parse-cmd. Warn that they will be
+   ## ignored - the parent build context's parse-cmd run already set
+   ## the env vars and we cannot re-run parse-cmd here without sourcing
+   ## the build infrastructure (which would change cwd).
+   echo "${0##*/}: WARNING: ignoring extra args (env vars already set by parent build context): ${forwarded_args[*]}" >&2
 fi
 
 ## ----------------------------------------------------------------------------
@@ -222,15 +242,6 @@ die() {
    printf '%s\n' "${bold}${red}${0##*/}: ERROR: $*${reset}" >&2
    exit 1
 }
-
-## ----------------------------------------------------------------------------
-## Apply --allow-untagged / --allow-uncommitted command-line overrides.
-## These take precedence over whatever 'help-steps/parse-cmd' (called from
-## a parent build context) or 'help-steps/variables' (defaulted to "false")
-## previously set the env vars to.
-## ----------------------------------------------------------------------------
-[ -z "$allow_untagged_arg" ]    || dist_build_ignore_untagged="$allow_untagged_arg"
-[ -z "$allow_uncommitted_arg" ] || dist_build_ignore_uncommitted="$allow_uncommitted_arg"
 
 ## ----------------------------------------------------------------------------
 ## Env var validation (all REQUIRED, no implicit defaults)
