@@ -298,6 +298,16 @@ die() {
 [ -n "${dist_build_ignore_untagged:-}" ]    || die "env var dist_build_ignore_untagged must be set ('true' or 'false')"
 [ -n "${dist_build_ignore_uncommitted:-}" ] || die "env var dist_build_ignore_uncommitted must be set ('true' or 'false')"
 
+## sq_git_policy_file must be an absolute path. Relative paths would
+## break in --mode submodules (where 'git submodule foreach --recursive'
+## runs per-submodule with a changed cwd) and are fragile around the
+## standalone bootstrap (which cd's to the main repo via 'variables').
+case "${sq_git_policy_file}" in
+   /*) ;;
+   *) die "sq_git_policy_file must be an absolute path, got: '${sq_git_policy_file}'" ;;
+esac
+[ -r "${sq_git_policy_file}" ] || die "sq_git_policy_file is not readable: '${sq_git_policy_file}'"
+
 case "${dist_build_ignore_untagged}" in
    true|false) ;;
    *) die "dist_build_ignore_untagged must be 'true' or 'false', got: '${dist_build_ignore_untagged}'" ;;
@@ -347,42 +357,56 @@ print_allow_hint() {
 mode_working_tree() {
    [ -n "$context" ] || die "--context is required for --mode working-tree"
 
-   local head git_tag_exact git_status
+   local head git_status
+   local annotated_tag_count=0
+   local lightweight_tag_list=""
+   local objtype tag_name
 
    head="$(git rev-parse HEAD)" || die "Failed to get HEAD for: ${context}"
 
    ## 1. Commit signature.
    sq_git_verify "${head}^{commit}" "${context} (commit ${head})" || exit 1
 
-   ## If HEAD is an exact annotated tag, also verify the tag object signature.
-   ## Policy: All git tags are always signed.
+   ## 2. Tag signature and tag-presence check.
    ##
-   ## Use 'git describe --exact-match' WITHOUT '--tags' so only annotated
-   ## tags count. Lightweight tags (bare refs pointing at a commit) have no
-   ## tag object to sign - they would effectively bypass signed-tag
-   ## verification otherwise. With '--tags', describe would return a
-   ## lightweight tag name and the subsequent 'sq_git_verify "$tag_name"'
-   ## would resolve it straight back to the commit, re-verifying the commit
-   ## signature instead of a tag object signature.
+   ## Enumerate EVERY ref under refs/tags that points at HEAD - not just
+   ## whichever one 'git describe --exact-match' would pick - so that a
+   ## co-located unsigned tag cannot slip past the check.
    ##
-   ## We additionally pass '${git_tag_exact}^{tag}' to force tag-object
-   ## resolution: this is a belt-and-suspenders guard that errors out if
-   ## for any reason the ref resolves to a non-tag object.
+   ## For each tag:
+   ##   - annotated tag (objecttype=tag): verify the tag object signature
+   ##     via '${tag}^{tag}' (the peel forces tag-object resolution).
+   ##   - lightweight tag (objecttype=commit): cannot carry a signature,
+   ##     so it cannot satisfy the 'all tags must be signed' policy.
+   ##     Treat the same as 'untagged' for --allow-untagged purposes
+   ##     (error out unless the operator explicitly opted in).
    ##
-   ## Policy scope: if multiple annotated tags point at HEAD, this
-   ## verifies ONE of them (whichever 'git describe' picks - typically
-   ## the most recent). This matches the intended policy "the checked-
-   ## out release tag must be signed and exact", not "every annotated
-   ## tag at this commit must satisfy policy". If the latter is ever
-   ## needed, replace 'git describe --exact-match' with a loop over
-   ## 'git tag --points-at HEAD' filtered by 'git cat-file -t = tag'.
-   git_tag_exact="$(git describe --exact-match HEAD 2>/dev/null)" || true
-   if [ -n "${git_tag_exact}" ]; then
-      sq_git_verify "${git_tag_exact}^{tag}" "${context} tag '${git_tag_exact}'" || exit 1
+   ## A commit with no annotated tag pointing at it is untagged for
+   ## policy purposes, same as before.
+   while IFS=$'\t' read -r objtype tag_name; do
+      [ -n "${tag_name}" ] || continue
+      case "${objtype}" in
+         tag)
+            sq_git_verify "${tag_name}^{tag}" "${context} tag '${tag_name}'" || exit 1
+            annotated_tag_count=$((annotated_tag_count + 1))
+            ;;
+         commit)
+            lightweight_tag_list="${lightweight_tag_list:+${lightweight_tag_list} }${tag_name}"
+            ;;
+      esac
+   done < <(git for-each-ref --points-at=HEAD --format='%(objecttype)%09%(refname:short)' refs/tags)
+
+   if [ -n "${lightweight_tag_list}" ]; then
+      if [ "${dist_build_ignore_untagged}" = "true" ]; then
+         echo "${cyan}INFO: Lightweight (unsignable) tag(s) on ${context}: ${lightweight_tag_list}; --allow-untagged set, continuing.${reset}"
+      else
+         echo "${bold}${red}ERROR: Lightweight (unsignable) tag(s) point at HEAD in ${context}: ${lightweight_tag_list}${reset}" >&2
+         echo "${cyan}INFO: Lightweight tags have no tag object and cannot carry an OpenPGP signature. Under the 'all tags must be signed' policy this is a violation. Remove them, replace with annotated signed tags, or pass --allow-untagged true.${reset}" >&2
+         exit 2
+      fi
    fi
 
-   ## 2. Untagged commit check.
-   if [ -z "${git_tag_exact}" ]; then
+   if [ "${annotated_tag_count}" -eq 0 ]; then
       if [ "${dist_build_ignore_untagged}" = "true" ]; then
          echo "${cyan}INFO: Untagged commit in ${context}, --allow-untagged set, continuing.${reset}"
       else
@@ -394,7 +418,11 @@ mode_working_tree() {
    fi
 
    ## 3. Uncommitted changes check.
-   git_status="$(git status --porcelain=v1 2>&1)"
+   ##
+   ## NOTE: No '2>&1' here. Merging git's stderr into the dirty-tree
+   ## signal would let unrelated warnings (e.g. advice messages, index
+   ## version warnings) be misinterpreted as uncommitted changes.
+   git_status="$(git status --porcelain=v1)"
    if [ -n "$git_status" ]; then
       if [ "${dist_build_ignore_uncommitted}" = "true" ]; then
          echo "${cyan}INFO: Uncommitted changes in ${context}, --allow-uncommitted set, continuing.${reset}"
@@ -460,6 +488,16 @@ mode_submodules() {
    ## at foreach start, so it always points to the root superproject.
    ## https://github.com/git/git/blob/master/builtin/submodule--helper.c
    ## (function runcommand_in_submodule_cb: toplevel = xgetcwd())
+   ##
+   ## Sanity-check that we can find this script in the superproject's
+   ## 'help-steps/' directory before invoking foreach. If the top-level
+   ## layout does not match, fail here with a clear error instead of a
+   ## confusing 'bash: ...git_sanity_test: No such file or directory'
+   ## inside each submodule.
+   local top_helper
+   top_helper="$(git rev-parse --show-toplevel)/help-steps/git_sanity_test"
+   [ -x "${top_helper}" ] || die "helper script not found or not executable at superproject path: '${top_helper}' (run --mode submodules from the superproject root)"
+
    sq_git_trust_root=HEAD \
       git submodule foreach --recursive \
          'bash "$toplevel/help-steps/git_sanity_test" --mode working-tree --context "$displaypath"'
