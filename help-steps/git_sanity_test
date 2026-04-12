@@ -3,13 +3,25 @@
 ## Copyright (C) 2012 - 2025 ENCRYPTED SUPPORT LLC <adrelanos@whonix.org>
 ## See the file COPYING for copying conditions.
 
-## Single-source git verification tool. Replaces the old bash functions
-## (signed_by_fingerprint, verify_ref, git_sanity_test_main, etc.) that
-## previously lived in 'help-steps/git_sanity_test'.
+## Single-source git verification tool. Verifies signatures, tag status, and
+## working-tree cleanliness for the main repo and recursively for all
+## submodules. Used by 'derivative-update' and 'build-steps.d/1100_sanity-tests',
+## and runnable standalone by developers.
 ##
-## Modes (--mode is REQUIRED, no default):
+## Usage:
+##   help-steps/git_sanity_test [--mode MODE] [options]
 ##
-##   working-tree --context LABEL
+##   With no arguments, defaults to '--mode all --context "main repo"',
+##   which verifies the current repository (main repo + all submodules)
+##   with the standard set of checks (signature, tag status, uncommitted).
+##
+## Modes:
+##
+##   --mode all --context LABEL
+##     'working-tree' on the current directory, then 'submodules'.
+##     This is the default when no '--mode' is given.
+##
+##   --mode working-tree --context LABEL
 ##     Verify the current working directory's git repo:
 ##       1. sq-git signature on HEAD commit
 ##       2. sq-git signature on the tag object (if HEAD is an exact tag)
@@ -17,20 +29,20 @@
 ##       4. uncommitted changes check
 ##     Exit codes: 0=ok, 1=signature, 2=untagged, 3=uncommitted
 ##
-##   ref --ref REF --ref-type {tag|commit}
+##   --mode ref --ref REF --ref-type {tag|commit}
 ##     Verify a specific ref's signature(s) only.
 ##       - Always checks the commit signature.
 ##       - For --ref-type tag, also checks the tag object signature.
 ##     Exit codes: 0=ok, 1=verification failed
 ##
-##   submodules
+##   --mode submodules
 ##     Recursively run 'working-tree' on every submodule via
 ##     'git submodule foreach --recursive'. Submodules use --trust-root HEAD
 ##     because the parent repo (already verified) pins each submodule commit.
 ##     Exit codes: 0=ok, non-zero=at least one submodule failed
 ##
-##   all --context LABEL
-##     'working-tree' on cwd, then 'submodules'.
+##   --help, -h
+##     Print this usage information and exit.
 ##
 ## Environment variables (all REQUIRED for security; no implicit defaults):
 ##
@@ -61,34 +73,45 @@
 ##   dist_source_help_steps_folder
 ##     Used only to print a 'cleanup-files' hint on uncommitted-changes
 ##     failure. If unset, the hint is omitted.
+##
+## Standalone use:
+##   When invoked directly by a developer (env vars not yet set), this
+##   script sources 'help-steps/pre', 'help-steps/colors', and
+##   'help-steps/variables' to populate the required env vars - the same
+##   way 'derivative-update' and 'build-steps.d/*' do. This makes the
+##   script Just Work when run from a freshly cloned working tree:
+##
+##     cd derivative-maker
+##     ./help-steps/git_sanity_test
+##
+##   When invoked from a build context (env vars already set), this
+##   script does NOT re-source the build infrastructure.
 
 set -e
 set -o pipefail
 
 MYDIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )" && pwd )"
 
-## Source 'colors' before enabling nounset; the colors script has an
-## unguarded read of '$dist_build_already_defined_colors' that would fail
-## under 'set -o nounset'.
-## The 'colors' function early-returns when TERM is empty (e.g. CI, redirected
-## output), leaving the color/format variables unset. Default them to empty
-## strings so 'set -o nounset' below does not trip.
-dist_build_already_defined_colors="${dist_build_already_defined_colors:-}"
-source "$MYDIR/colors"
-colors
-: "${bold:=}" "${red:=}" "${cyan:=}" "${under:=}" "${eunder:=}" "${reset:=}"
-
-set -o nounset
-
-die() {
-   printf '%s\n' "${bold}${red}${0##*/}: ERROR: $*${reset}" >&2
-   exit 1
-}
+## ----------------------------------------------------------------------------
+## Argument parsing
+## ----------------------------------------------------------------------------
 
 mode=""
 context=""
 ref=""
 ref_type=""
+
+print_help() {
+   ## Print the leading doc comments (## ...) at the top of this file,
+   ## stopping at the first non-comment, non-blank line. Skips the shebang
+   ## and any single-# lines.
+   awk '
+      NR == 1 && /^#!/   { next }
+      /^##/              { sub(/^## ?/, ""); print; next }
+      /^[[:space:]]*$/   { print; next }
+      { exit }
+   ' "$0"
+}
 
 while [ $# -gt 0 ]; do
    case "$1" in
@@ -96,19 +119,76 @@ while [ $# -gt 0 ]; do
       --context)  context="${2:-}";  shift 2 ;;
       --ref)      ref="${2:-}";      shift 2 ;;
       --ref-type) ref_type="${2:-}"; shift 2 ;;
-      --help|-h)
-         sed -n 's/^## \{0,1\}//p' "$0" | head -n 40
-         exit 0
+      --help|-h)  print_help; exit 0 ;;
+      *)
+         printf '%s\n' "${0##*/}: ERROR: unknown option: $1" >&2
+         exit 1
          ;;
-      *) die "unknown option: $1" ;;
    esac
 done
 
-[ -n "$mode" ] || die "--mode is required (working-tree | ref | submodules | all)"
+## Default mode: when run with no '--mode', do the most thorough check
+## (main repo + all submodules). This is the safest default.
+[ -n "$mode" ] || mode="all"
+case "$mode" in
+   all|working-tree)
+      [ -n "$context" ] || context="main repo"
+      ;;
+esac
 
-## All security-relevant env vars are REQUIRED. No implicit defaults: the
-## caller must make an explicit decision. 'help-steps/variables' sets all
-## of these.
+## ----------------------------------------------------------------------------
+## Standalone-use bootstrap: source build infrastructure if env vars unset.
+## ----------------------------------------------------------------------------
+##
+## When invoked from 'derivative-update' or 'build-steps.d/1100_sanity-tests',
+## the build infrastructure has already been sourced and the env vars are set.
+## When invoked directly by a developer, the env vars are unset; we source
+## 'pre', 'colors', and 'variables' to populate them - the same scripts the
+## normal callers source.
+##
+## Sourcing happens inside a function so '$@' is empty when 'parse-cmd' is
+## called transitively from 'variables' (parse-cmd would otherwise complain
+## about our --mode/--context/--ref args being unknown options).
+##
+## NOTE: 'pre' disables 'set -e' and installs ERR/EXIT traps for build-step
+## error handling. Our explicit 'exit N' calls still propagate via pre's
+## EXIT trap. Unexpected command failures are caught by pre's ERR trap.
+maybe_source_build_infrastructure() {
+   if [ -n "${sq_git_policy_file:-}" ]; then
+      return 0
+   fi
+   ## $@ is empty inside this function (called with no args), so 'parse-cmd'
+   ## (transitively sourced by 'variables') sees no positional parameters.
+   ## 'dist_build_internal_run=true' tells parse-cmd to accept zero args.
+   dist_build_internal_run="true"
+   source "$MYDIR/pre"
+   source "$MYDIR/colors"
+   source "$MYDIR/variables"
+}
+maybe_source_build_infrastructure
+
+## ----------------------------------------------------------------------------
+## Colors
+## ----------------------------------------------------------------------------
+##
+## Source 'colors' if not already sourced. The 'colors' function early-returns
+## when TERM is empty (e.g. CI, redirected output), leaving the format
+## variables unset. Default them to empty strings so references below are safe.
+if [ -z "${dist_build_already_defined_colors:-}" ]; then
+   source "$MYDIR/colors"
+   colors
+fi
+: "${bold:=}" "${red:=}" "${cyan:=}" "${under:=}" "${eunder:=}" "${reset:=}"
+
+die() {
+   printf '%s\n' "${bold}${red}${0##*/}: ERROR: $*${reset}" >&2
+   exit 1
+}
+
+## ----------------------------------------------------------------------------
+## Env var validation (all REQUIRED, no implicit defaults)
+## ----------------------------------------------------------------------------
+
 [ -n "${sq_git_policy_file:-}" ]            || die "env var sq_git_policy_file must be set"
 [ -n "${sq_git_trust_root:-}" ]             || die "env var sq_git_trust_root must be set"
 [ -n "${dist_build_ignore_untagged:-}" ]    || die "env var dist_build_ignore_untagged must be set ('true' or 'false')"
@@ -124,6 +204,10 @@ case "${dist_build_ignore_uncommitted}" in
 esac
 
 trust_root="${sq_git_trust_root}"
+
+## ----------------------------------------------------------------------------
+## Verification primitives
+## ----------------------------------------------------------------------------
 
 ## sq-git allows offloading the complexity of OpenPGP signing key import.
 ## File 'openpgp-policy.toml' contains authorized signing key(s) and supports
@@ -146,6 +230,10 @@ print_allow_hint() {
    echo "${under}WARNING:${eunder} This can be ${under}insecure${eunder} if you cannot audit the changes." >&2
    echo "${bold}${under}--allow-untagged true${eunder} ${under}--allow-uncommitted true${eunder}${reset}" >&2
 }
+
+## ----------------------------------------------------------------------------
+## Modes
+## ----------------------------------------------------------------------------
 
 mode_working_tree() {
    [ -n "$context" ] || die "--context is required for --mode working-tree"
