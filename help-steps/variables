@@ -799,8 +799,17 @@ fi
 ## {{{ dist_build_current_git_head
 
 ## Get the ref (branch or commit) that we're currently at.
+##
+## Unconditionally recompute from 'git rev-parse HEAD'. Do NOT honor a
+## caller-provided value: this variable is used by 'derivative-update' as
+## the 'recover_commit' passed to 'abort_update()' on verification
+## failures. Letting a caller override it would let an attacker with
+## environment access point the recovery to an arbitrary commit,
+## effectively directing 'git reset --hard --recurse-submodules' at an
+## untrusted state after a failed signature check.
+##
 ## NOTE: Cannot use end-of-options ("--").
-[ -n "$dist_build_current_git_head" ] || dist_build_current_git_head="$($git_bin rev-parse HEAD)" || error 'Cannot get head commit ID!'
+dist_build_current_git_head="$($git_bin rev-parse HEAD)" || error 'Cannot get head commit ID!'
 
 #printf "%s\n" "dist_build_current_git_head: $dist_build_current_git_head"
 

@@ -34,6 +34,13 @@ error_handler_dist_build_one() {
 
 trap "error_handler_dist_build_one" ERR
 
+## abort_update: roll back to a known-good state on verification failure.
+##
+## Callers pass '${dist_build_current_git_head}' as 'recover_commit'. That
+## variable is set by 'help-steps/variables' (sourced above) from
+## 'git rev-parse HEAD' at script start; it is NOT set by the git
+## verification helper. It remains available in this (parent) shell even
+## though 'git_sanity_test' now runs as a child process.
 abort_update() {
   local error_msg recover_commit branch_reset_commit
 
