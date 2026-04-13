@@ -23,16 +23,27 @@
 ##
 ##   --mode working-tree --context LABEL
 ##     Verify the current working directory's git repo:
-##       1. sq-git signature on HEAD commit
-##       2. sq-git signature on the tag object (if HEAD is an exact tag)
-##       3. untagged commit check
-##       4. uncommitted changes check
+##       1. Authenticate HEAD commit against sq_git_trust_root via
+##          'sq-git log' (walks the commit chain, validates each
+##          commit signature against openpgp-policy.toml).
+##       2. Tag hygiene: at most one tag at HEAD, and it must be
+##          annotated (not lightweight). The tag OBJECT signature is
+##          NOT verified; sq-git log authenticates commit ranges, not
+##          tag objects. Release trust rests on the target commit's
+##          authentication (step 1).
+##       3. Untagged commit check.
+##       4. Uncommitted changes check.
 ##     Exit codes: 0=ok, 1=signature, 2=untagged, 3=uncommitted
 ##
 ##   --mode ref --ref REF --ref-type {tag|commit}
-##     Verify a specific ref's signature(s) only.
-##       - Always checks the commit signature.
-##       - For --ref-type tag, also checks the tag object signature.
+##     Authenticate a specific ref's target commit.
+##     - Resolves REF to a commit (tag -> its target commit).
+##     - Authenticates that commit via 'sq-git log' from the trust
+##       root, the same as --mode working-tree step 1.
+##     - For --ref-type tag, additionally requires REF to be an
+##       annotated tag (hygiene check via 'git cat-file -t'). The
+##       tag object signature is NOT cryptographically verified;
+##       see the note under --mode working-tree above.
 ##     Exit codes: 0=ok, 1=verification failed
 ##
 ##   --mode submodules
@@ -355,36 +366,58 @@ print_allow_hint() {
 mode_working_tree() {
    [ -n "$context" ] || die "--context is required for --mode working-tree"
 
-   local head git_status git_tags_output
+   local head git_status git_tags_output trust_root_commit tag_refname tag_objtype
    local -a tags_at_head git_tags_cmd
 
    head="$(git rev-parse HEAD)" || die "Failed to get HEAD for: ${context}"
 
-   ## 1. Commit signature.
-   sq_git_verify "${head}^{commit}" "${context} (commit ${head})" || exit 1
-
-   ## 2. Tag check. Policy: a commit has either zero tags or exactly
-   ## one tag, and that tag must be an annotated signed tag.
+   ## 1. Commit authentication via sq-git log.
    ##
-   ## Rationale for "at most one tag":
+   ## sq-git log walks the commit chain from sq_git_trust_root to the
+   ## target commit, validating each commit's signature against the
+   ## authorized signers in openpgp-policy.toml.
+   ##
+   ## EDGE CASE: when sq_git_trust_root resolves to the same commit as
+   ## the target, sq-git log has an empty range to walk and errors out
+   ## with "The given range contains no commits"
+   ## (https://gitlab.com/sequoia-pgp/sequoia-git/-/issues/37).
+   ## This happens in the common "trust root = HEAD" setup used by CI
+   ## and non-redistributable builds (help-steps/variables). In that
+   ## case the caller has declared HEAD as the trust root (TOFU
+   ## model); there is no commit chain to walk and the authentication
+   ## trivially holds.
+   if ! trust_root_commit="$(git rev-parse --verify "${trust_root}^{commit}" 2>/dev/null)"; then
+      die "could not resolve sq_git_trust_root '${trust_root}' to a commit in ${context}"
+   fi
+   if [ "$head" = "$trust_root_commit" ]; then
+      true "INFO: ${context} HEAD ${head} is the sq_git_trust_root; sq-git log range is empty, authentication trivially holds"
+   else
+      sq_git_verify "${head}^{commit}" "${context} (commit ${head})" || exit 1
+   fi
+
+   ## 2. Tag hygiene check. Policy: a commit has either zero tags or
+   ## exactly one annotated tag.
+   ##
+   ## Rationale:
    ## - makes release identity unambiguous (commit X = release Y, not
    ##   "maybe release Y or maybe release Z")
-   ## - closes the signed-tag bypass where an unsigned second tag on the
-   ##   same commit as a signed release tag would previously slip past
-   ##   'git describe --exact-match'
-   ## - keeps the check trivial: one case split on tag count
+   ## - closes the bypass where an unsigned second tag on the same
+   ##   commit as a signed release tag could slip past verification
    ##
-   ## Lightweight tag handling is implicit: the '^{tag}' peel below forces
-   ## annotated-tag resolution. A lightweight tag has no tag object, so
-   ## 'sq-git log -- <tag>^{tag}' errors out, which is the correct
-   ## outcome under "all tags must be signed".
+   ## NOTE: sq-git log cannot verify tag OBJECT signatures - it only
+   ## authenticates commit ranges. Earlier revisions of this script
+   ## tried 'sq-git log -- ${tag}^{tag}' hoping to verify annotated
+   ## tag signatures; that is unsupported by sq-git's design. The
+   ## target commit's authentication (step 1 above) is what actually
+   ## gates release trust. Tag hygiene here is:
+   ##   - at most one tag at the commit (ambiguity prevention)
+   ##   - the tag must be annotated, not lightweight (release hygiene;
+   ##     lightweight tags cannot carry metadata)
+   ## The tag OBJECT signature itself is not verified.
    ##
-   ## Capture the git output via '$()' (not 'readarray < <(...)' process
-   ## substitution) so that a failing 'git for-each-ref' is detectable -
-   ## process substitution runs the producer in a subshell whose exit
-   ## status readarray cannot observe, silently turning git failures
-   ## into "no tags found".
-   git_tags_cmd=( git for-each-ref --points-at=HEAD --format='%(refname:short)' refs/tags )
+   ## We use %(refname) not %(refname:short) to avoid branch/tag
+   ## naming collisions when the value is fed back into git commands.
+   git_tags_cmd=( git for-each-ref --points-at=HEAD --format='%(refname)' refs/tags )
    if ! git_tags_output="$( "${git_tags_cmd[@]}" )"; then
       die "'${git_tags_cmd[*]}' failed in ${context}"
    fi
@@ -406,7 +439,15 @@ mode_working_tree() {
          fi
          ;;
       1)
-         sq_git_verify "${tags_at_head[0]}^{tag}" "${context} tag '${tags_at_head[0]}'" || exit 1
+         tag_refname="${tags_at_head[0]}"
+         if ! tag_objtype="$(git cat-file -t "${tag_refname}")"; then
+            die "cannot inspect tag '${tag_refname}' in ${context}"
+         fi
+         if [ "$tag_objtype" != "tag" ]; then
+            echo "${bold}${red}ERROR: Tag '${tag_refname}' in ${context} is a lightweight tag, not annotated${reset}" >&2
+            echo "${cyan}INFO: Release tags must be annotated ('git tag -a') so they carry metadata. Remove the lightweight tag or recreate it as annotated.${reset}" >&2
+            exit 2
+         fi
          ;;
       *)
          echo "${bold}${red}ERROR: Multiple tags point at HEAD in ${context}: ${tags_at_head[*]}${reset}" >&2
@@ -451,22 +492,44 @@ mode_ref() {
       *) die "--ref-type must be 'tag' or 'commit'" ;;
    esac
 
-   ## Always verify the commit signature.
-   sq_git_verify "${ref}^{commit}" "ref '${ref}' (commit)" || exit 1
+   local ref_commit trust_root_commit ref_objtype
 
-   ## For tags, also verify the tag object signature.
+   ## Resolve the ref to its target commit. For an annotated tag this
+   ## is the commit the tag points at; for a lightweight tag or branch
+   ## or raw SHA this is the commit itself.
+   if ! ref_commit="$(git rev-parse --verify "${ref}^{commit}" 2>/dev/null)"; then
+      die "could not resolve ref '${ref}' to a commit"
+   fi
+
+   ## When --ref-type is 'tag', enforce that the ref is actually an
+   ## annotated tag (has a tag object). Lightweight tags do not carry
+   ## metadata and are inappropriate for release identification.
    ##
-   ## Use '${ref}^{tag}' to force tag-object resolution: lightweight tags
-   ## (bare refs that resolve straight to a commit) cannot satisfy this
-   ## and the peel will fail, which is the correct behaviour under our
-   ## "all tags must be signed" policy. Verifying '${ref}' without the
-   ## peel would re-verify the commit for a lightweight tag, silently
-   ## bypassing signed-tag verification.
-   ##
-   ## NOTE: Not using 'refs/tags/' prefix here. The caller is responsible for
-   ## passing an unambiguous ref. sq-git resolves it via the local repo.
+   ## NOTE: sq-git log authenticates commit ranges, not tag objects -
+   ## so we cannot verify the tag object's signature here. The caller's
+   ## trust comes from authenticating the TARGET commit below, not
+   ## from a tag-object signature check. --ref-type tag therefore only
+   ## adds an "is annotated?" hygiene check over --ref-type commit.
    if [ "$ref_type" = 'tag' ]; then
-      sq_git_verify "${ref}^{tag}" "ref '${ref}' (tag object)" || exit 1
+      if ! ref_objtype="$(git cat-file -t "${ref}")"; then
+         die "cannot inspect ref '${ref}'"
+      fi
+      if [ "$ref_objtype" != "tag" ]; then
+         die "ref '${ref}' was declared as --ref-type tag but is not an annotated tag (cat-file type: ${ref_objtype})"
+      fi
+   fi
+
+   ## Authenticate the target commit via sq-git log.
+   ##
+   ## Short-circuit if the target commit IS the sq_git_trust_root:
+   ## sq-git log errors on an empty range (sequoia-git issue #37).
+   if ! trust_root_commit="$(git rev-parse --verify "${trust_root}^{commit}" 2>/dev/null)"; then
+      die "could not resolve sq_git_trust_root '${trust_root}' to a commit"
+   fi
+   if [ "$ref_commit" = "$trust_root_commit" ]; then
+      true "INFO: ref '${ref}' is the sq_git_trust_root; sq-git log range is empty, authentication trivially holds"
+   else
+      sq_git_verify "${ref_commit}" "ref '${ref}' (commit ${ref_commit})" || exit 1
    fi
 }
 
