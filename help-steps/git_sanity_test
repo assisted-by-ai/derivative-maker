@@ -116,6 +116,63 @@
 ##
 ##   When invoked from a build context (env vars already set), this
 ##   script does NOT re-source the build infrastructure.
+##
+## Trust model:
+##
+##   sq-git log authenticates a commit range from 'sq_git_trust_root'
+##   to a target commit against the authorized signers listed in
+##   'openpgp-policy.toml'. The trust root is the anchor: sq-git does
+##   NOT cryptographically re-verify the trust root itself; it is
+##   accepted as definitionally trusted.
+##
+##   TOFU (trust-on-first-use) model:
+##     CI builds and non-redistributable builds set
+##     'sq_git_trust_root="HEAD"' in help-steps/variables. In that
+##     case sq-git log's "chain" is the single commit HEAD itself and
+##     authentication is definitional (the script accepts HEAD because
+##     the caller declared HEAD as the trust root, not because sq-git
+##     walked any signatures). On first run the operator must verify
+##     the checkout manually - see:
+##     https://www.kicksecure.com/wiki/Dev/Build_Documentation/images
+##     On subsequent runs, 'derivative-update' plus this script keep
+##     the checkout pinned to a verified state as long as the trust
+##     root declaration itself is not tampered with.
+##
+##   Redistributable builds (non-CI) pin 'sq_git_trust_root' to a
+##   specific historical commit in help-steps/variables. sq-git log
+##   then walks the chain from that commit to HEAD, validating every
+##   commit signature in between; this is strictly stronger than TOFU.
+##
+## Submodule trust model:
+##
+##   '--mode submodules' iterates every submodule via 'git submodule
+##   foreach --recursive' and runs '--mode working-tree' on each.
+##   Every submodule invocation forces 'sq_git_trust_root=HEAD' (the
+##   submodule's HEAD), which is the TOFU case described above. The
+##   real integrity guarantee for submodule commits comes from the
+##   SUPERPROJECT's verification: the parent repo was already
+##   authenticated by the main '--mode working-tree' pass, and the
+##   parent repo pins each submodule's gitlink (commit SHA). Anyone
+##   able to tamper with a submodule's HEAD without also tampering
+##   with the superproject commit would be caught at the superproject
+##   level. The per-submodule sq-git log call here is definitional,
+##   plus the tag / uncommitted-changes hygiene checks.
+##
+## sq-git version assumption:
+##
+##   This script targets sequoia-git 0.4.0+ as shipped in Debian
+##   trixie ('sequoia-git' package). It does NOT carry workarounds
+##   for older sq-git behaviours by design. Specifically:
+##
+##     - sequoia-git issue #37 ('sq-git log --trust-root=HEAD HEAD'
+##       errored with "The given range contains no commits") was
+##       fixed in 2023. We rely on the fixed behaviour where sq-git
+##       log accepts trust_root == target and prints:
+##         "Verified that there is an authenticated path from the
+##          trust root <sha> to <sha>."
+##
+##   If you hit an sq-git issue that predates 0.4.0, please upgrade
+##   sequoia-git rather than adding a workaround here.
 
 set -e
 set -o pipefail
@@ -238,12 +295,20 @@ esac
 ##
 ## Why conditional (and not the standard help-steps unconditional pattern):
 ## sourcing 'help-steps/variables' executes 'cd "$source_code_folder_dist"'
-## (variables line ~121), which moves the cwd to the main repo. When this
-## script is invoked recursively via 'git submodule foreach' (--mode
-## submodules below), the cwd is the submodule directory and must stay
-## there for 'git rev-parse HEAD' / 'git status' to operate on the
-## submodule. Skipping the sourcing in that case (env vars are already
-## inherited from the parent) preserves the cwd.
+## (variables line ~121), which moves the cwd to the main repo. Two
+## consequences are handled:
+##
+##   1. 'git submodule foreach --recursive' re-invokes this script from
+##      each submodule directory. In that case the env vars are already
+##      inherited from the parent ('dist_build_one_parsed=true'), the
+##      bootstrap is skipped, and the cwd stays in the submodule where
+##      'git rev-parse HEAD' / 'git status' operate on the submodule.
+##
+##   2. In the standalone bootstrap path, we save $PWD before sourcing
+##      and restore it afterwards so that '--mode working-tree' keeps
+##      verifying the repo at the caller's original cwd - matching the
+##      documented behaviour "Verify the current working directory's
+##      git repo".
 ##
 ## We forward unrecognized command-line args (e.g. --allow-untagged true,
 ## --allow-uncommitted true, --debug) to 'help-steps/parse-cmd' via 'help-
@@ -259,12 +324,23 @@ esac
 ## NOTE: 'pre' disables 'set -e' and installs ERR/EXIT traps for build-step
 ## error handling. Our explicit 'exit N' calls still propagate via pre's
 ## EXIT trap. Unexpected command failures are caught by pre's ERR trap.
+##
+## cwd handling: 'help-steps/variables' contains 'cd "$source_code_folder_dist"'
+## (line ~121) which moves the cwd to the main repo. For --mode working-tree
+## the doc promises we verify "the current working directory's git repo",
+## so we save $PWD before sourcing and restore it afterwards. This matters
+## when the caller runs us from a subdirectory of the main repo, or from
+## inside a submodule / other nested git repo, and expects that repo to
+## be the subject of verification.
 if [ "${dist_build_one_parsed:-}" != "true" ]; then
+   orig_pwd="$PWD"
    set -- "${forwarded_args[@]}"
    dist_build_internal_run="true"
    source "$MYDIR/pre"
    source "$MYDIR/colors"
    source "$MYDIR/variables"
+   cd -- "$orig_pwd" || die "cannot restore original cwd: $orig_pwd"
+   unset orig_pwd
 elif [ "${#forwarded_args[@]}" -gt 0 ]; then
    ## Build-context invocation: env vars are already set, but the user
    ## passed extra args meant for parse-cmd. We cannot re-run parse-cmd
@@ -326,8 +402,6 @@ case "${dist_build_ignore_uncommitted}" in
    *) die "dist_build_ignore_uncommitted must be 'true' or 'false', got: '${dist_build_ignore_uncommitted}'" ;;
 esac
 
-trust_root="${sq_git_trust_root}"
-
 ## ----------------------------------------------------------------------------
 ## Verification primitives
 ## ----------------------------------------------------------------------------
@@ -338,7 +412,7 @@ trust_root="${sq_git_trust_root}"
 sq_git_verify() {
    local target="$1"
    local label="$2"
-   if sq-git log --policy-file "${sq_git_policy_file}" --trust-root "${trust_root}" -- "${target}"; then
+   if sq-git log --policy-file "${sq_git_policy_file}" --trust-root "${sq_git_trust_root}" -- "${target}"; then
       ## 'true "..."' is the codebase trace idiom (see help-steps/pre,
       ## variables, derivative-update): the string appears in 'set -x'
       ## output as '+ true ...' and is silent otherwise. Intentionally
@@ -366,34 +440,26 @@ print_allow_hint() {
 mode_working_tree() {
    [ -n "$context" ] || die "--context is required for --mode working-tree"
 
-   local head git_status git_tags_output trust_root_commit tag_refname tag_objtype
+   local head git_status git_tags_output tag_refname tag_objtype
    local -a tags_at_head git_tags_cmd
 
    head="$(git rev-parse HEAD)" || die "Failed to get HEAD for: ${context}"
 
    ## 1. Commit authentication via sq-git log.
    ##
-   ## sq-git log walks the commit chain from sq_git_trust_root to the
-   ## target commit, validating each commit's signature against the
-   ## authorized signers in openpgp-policy.toml.
+   ## sq-git log walks the commit chain from sq_git_trust_root to HEAD,
+   ## validating each commit's signature against the authorized signers
+   ## in openpgp-policy.toml. When sq_git_trust_root == HEAD, the chain
+   ## is the single commit HEAD itself and sq-git log prints:
    ##
-   ## EDGE CASE: when sq_git_trust_root resolves to the same commit as
-   ## the target, sq-git log has an empty range to walk and errors out
-   ## with "The given range contains no commits"
-   ## (https://gitlab.com/sequoia-pgp/sequoia-git/-/issues/37).
-   ## This happens in the common "trust root = HEAD" setup used by CI
-   ## and non-redistributable builds (help-steps/variables). In that
-   ## case the caller has declared HEAD as the trust root (TOFU
-   ## model); there is no commit chain to walk and the authentication
-   ## trivially holds.
-   if ! trust_root_commit="$(git rev-parse --verify "${trust_root}^{commit}" 2>/dev/null)"; then
-      die "could not resolve sq_git_trust_root '${trust_root}' to a commit in ${context}"
-   fi
-   if [ "$head" = "$trust_root_commit" ]; then
-      true "INFO: ${context} HEAD ${head} is the sq_git_trust_root; sq-git log range is empty, authentication trivially holds"
-   else
-      sq_git_verify "${head}^{commit}" "${context} (commit ${head})" || exit 1
-   fi
+   ##   Verified that there is an authenticated path from the trust
+   ##   root <sha> to <sha>.
+   ##
+   ## and exits 0 (sequoia-git 0.4.0+ on Debian trixie; issue #37 was
+   ## fixed in 2023). In that TOFU case the caller has declared HEAD
+   ## as the trust root and the authentication is definitional rather
+   ## than walk-based; see the "TOFU model" block in the header.
+   sq_git_verify "${head}^{commit}" "${context} (commit ${head})" || exit 1
 
    ## 2. Tag hygiene check. Policy: a commit has either zero tags or
    ## exactly one annotated tag.
@@ -492,45 +558,51 @@ mode_ref() {
       *) die "--ref-type must be 'tag' or 'commit'" ;;
    esac
 
-   local ref_commit trust_root_commit ref_objtype
+   local resolve_ref ref_commit ref_objtype
 
-   ## Resolve the ref to its target commit. For an annotated tag this
-   ## is the commit the tag points at; for a lightweight tag or branch
-   ## or raw SHA this is the commit itself.
-   if ! ref_commit="$(git rev-parse --verify "${ref}^{commit}" 2>/dev/null)"; then
-      die "could not resolve ref '${ref}' to a commit"
-   fi
-
-   ## When --ref-type is 'tag', enforce that the ref is actually an
-   ## annotated tag (has a tag object). Lightweight tags do not carry
-   ## metadata and are inappropriate for release identification.
-   ##
-   ## NOTE: sq-git log authenticates commit ranges, not tag objects -
-   ## so we cannot verify the tag object's signature here. The caller's
-   ## trust comes from authenticating the TARGET commit below, not
-   ## from a tag-object signature check. --ref-type tag therefore only
-   ## adds an "is annotated?" hygiene check over --ref-type commit.
+   ## For --ref-type tag, force resolution under 'refs/tags/' so that:
+   ##   - a branch / raw commit / ambiguous short name cannot be mistaken
+   ##     for a tag
+   ##   - the tag must actually exist in the local repo under refs/tags/
+   ##   - 'git cat-file -t' below operates on the tag ref, not on an
+   ##     ambiguous short name
+   ## For --ref-type commit, accept any valid commit-ish (branch name,
+   ## commit SHA, etc.).
    if [ "$ref_type" = 'tag' ]; then
-      if ! ref_objtype="$(git cat-file -t "${ref}")"; then
-         die "cannot inspect ref '${ref}'"
+      resolve_ref="refs/tags/${ref}"
+      git show-ref --verify --quiet "${resolve_ref}" \
+         || die "tag ref not found under refs/tags/: '${ref}'"
+      if ! ref_objtype="$(git cat-file -t "${resolve_ref}")"; then
+         die "cannot inspect tag ref '${resolve_ref}'"
       fi
+      ## Enforce that the tag is annotated (has a tag object).
+      ## Lightweight tags cannot carry metadata and are inappropriate
+      ## for release identification.
+      ##
+      ## NOTE: sq-git log authenticates commit ranges, not tag objects -
+      ## so we cannot cryptographically verify the tag object signature
+      ## here. --ref-type tag's guarantee over --ref-type commit is:
+      ##   - the ref exists under refs/tags/
+      ##   - the tag is annotated (has a tag object)
+      ## Release trust itself still comes from authenticating the tag's
+      ## TARGET commit below.
       if [ "$ref_objtype" != "tag" ]; then
          die "ref '${ref}' was declared as --ref-type tag but is not an annotated tag (cat-file type: ${ref_objtype})"
       fi
+   else
+      resolve_ref="${ref}"
+   fi
+
+   ## Resolve to the target commit SHA.
+   if ! ref_commit="$(git rev-parse --verify "${resolve_ref}^{commit}" 2>/dev/null)"; then
+      die "could not resolve ref '${ref}' to a commit"
    fi
 
    ## Authenticate the target commit via sq-git log.
-   ##
-   ## Short-circuit if the target commit IS the sq_git_trust_root:
-   ## sq-git log errors on an empty range (sequoia-git issue #37).
-   if ! trust_root_commit="$(git rev-parse --verify "${trust_root}^{commit}" 2>/dev/null)"; then
-      die "could not resolve sq_git_trust_root '${trust_root}' to a commit"
-   fi
-   if [ "$ref_commit" = "$trust_root_commit" ]; then
-      true "INFO: ref '${ref}' is the sq_git_trust_root; sq-git log range is empty, authentication trivially holds"
-   else
-      sq_git_verify "${ref_commit}" "ref '${ref}' (commit ${ref_commit})" || exit 1
-   fi
+   ## When sq_git_trust_root == ref_commit, sq-git log authenticates
+   ## the single-commit 'chain' trivially (TOFU); see
+   ## 'mode_working_tree' for details.
+   sq_git_verify "${ref_commit}" "ref '${ref}' (commit ${ref_commit})" || exit 1
 }
 
 mode_submodules() {
@@ -557,7 +629,10 @@ mode_submodules() {
    ## inside each submodule.
    local top_helper
    top_helper="$(git rev-parse --show-toplevel)/help-steps/git_sanity_test"
-   [ -x "${top_helper}" ] || die "helper script not found or not executable at superproject path: '${top_helper}' (run --mode submodules from the superproject root)"
+   ## Use '[ -r ]' not '[ -x ]' - we invoke the helper as 'bash
+   ## "$top_helper"' which only needs read permission on the file;
+   ## the execute bit on the file itself is not consulted.
+   [ -r "${top_helper}" ] || die "helper script not found or not readable at superproject path: '${top_helper}'"
 
    sq_git_trust_root=HEAD \
       git submodule foreach --recursive \
