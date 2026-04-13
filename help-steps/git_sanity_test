@@ -275,14 +275,12 @@ fi
 ## Colors
 ## ----------------------------------------------------------------------------
 ##
-## Source 'colors' if not already sourced. The 'colors' function early-returns
-## when TERM is empty (e.g. CI, redirected output), leaving the format
-## variables unset. Default them to empty strings so references below are safe.
-if [ -z "${dist_build_already_defined_colors:-}" ]; then
-   source "$MYDIR/colors"
-   colors
-fi
-: "${bold:=}" "${red:=}" "${cyan:=}" "${under:=}" "${eunder:=}" "${reset:=}"
+## 'help-steps/colors' defines the 'colors' function and auto-invokes it
+## unless 'dist_build_already_defined_colors=true' is already set. It is
+## idempotent and safe to source whether or not the bootstrap above
+## already sourced it. Color variables are unset (i.e. expand to "") when
+## there is no TTY, which is fine - this script does not use 'set -u'.
+source "$MYDIR/colors"
 
 die() {
    printf '%s\n' "${bold}${red}${0##*/}: ERROR: $*${reset}" >&2
@@ -357,8 +355,8 @@ print_allow_hint() {
 mode_working_tree() {
    [ -n "$context" ] || die "--context is required for --mode working-tree"
 
-   local head git_status
-   local -a tags_at_head
+   local head git_status git_tags_output
+   local -a tags_at_head git_tags_cmd
 
    head="$(git rev-parse HEAD)" || die "Failed to get HEAD for: ${context}"
 
@@ -380,7 +378,21 @@ mode_working_tree() {
    ## annotated-tag resolution. A lightweight tag has no tag object, so
    ## 'sq-git log -- <tag>^{tag}' errors out, which is the correct
    ## outcome under "all tags must be signed".
-   readarray -t tags_at_head < <(git for-each-ref --points-at=HEAD --format='%(refname:short)' refs/tags)
+   ##
+   ## Capture the git output via '$()' (not 'readarray < <(...)' process
+   ## substitution) so that a failing 'git for-each-ref' is detectable -
+   ## process substitution runs the producer in a subshell whose exit
+   ## status readarray cannot observe, silently turning git failures
+   ## into "no tags found".
+   git_tags_cmd=( git for-each-ref --points-at=HEAD --format='%(refname:short)' refs/tags )
+   if ! git_tags_output="$( "${git_tags_cmd[@]}" )"; then
+      die "'${git_tags_cmd[*]}' failed in ${context}"
+   fi
+   if [ -n "$git_tags_output" ]; then
+      readarray -t tags_at_head <<< "$git_tags_output"
+   else
+      tags_at_head=()
+   fi
 
    case "${#tags_at_head[@]}" in
       0)
