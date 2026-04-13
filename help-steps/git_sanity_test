@@ -179,6 +179,22 @@ set -o pipefail
 
 MYDIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )" && pwd )"
 
+## Define 'die' early, BEFORE the standalone bootstrap below, because the
+## bootstrap's cwd-restore step ('cd -- "$orig_pwd" || die ...') would
+## otherwise reference a not-yet-defined function. Shell functions are
+## not hoisted, so calling die before its definition would fail with a
+## "command not found" instead of our intended error.
+##
+## The color variables referenced inside die are unset at this point;
+## this script does not use 'set -u', so unset expansions become empty
+## strings, which is correct for a non-coloured error message. After
+## 'colors' is sourced below, subsequent die calls pick up the colours
+## automatically.
+die() {
+   printf '%s\n' "${bold}${red}${0##*/}: ERROR: $*${reset}" >&2
+   exit 1
+}
+
 ## ----------------------------------------------------------------------------
 ## Argument parsing
 ## ----------------------------------------------------------------------------
@@ -367,12 +383,8 @@ fi
 ## idempotent and safe to source whether or not the bootstrap above
 ## already sourced it. Color variables are unset (i.e. expand to "") when
 ## there is no TTY, which is fine - this script does not use 'set -u'.
+## (die() is defined near the top of the file, before the bootstrap.)
 source "$MYDIR/colors"
-
-die() {
-   printf '%s\n' "${bold}${red}${0##*/}: ERROR: $*${reset}" >&2
-   exit 1
-}
 
 ## ----------------------------------------------------------------------------
 ## Env var validation (all REQUIRED, no implicit defaults)
@@ -433,6 +445,58 @@ print_allow_hint() {
    echo "${bold}${under}--allow-untagged true${eunder} ${under}--allow-uncommitted true${eunder}${reset}" >&2
 }
 
+## Classify a tag ref into one of three states:
+##
+##    lightweight        - no tag object at all (ref points directly at a
+##                         commit). Cannot carry a signature by definition.
+##    annotated-unsigned - tag object exists but has no PGP signature block.
+##    annotated-signed   - tag object exists and contains a PGP signature
+##                         block. (Cryptographic verification of the
+##                         signature is NOT performed here - sq-git log
+##                         authenticates the target commit instead; see
+##                         the header "Trust model" section.)
+##
+## Takes a fully qualified tag ref (e.g. 'refs/tags/v1.0') and dies with
+## a clear error for the lightweight and annotated-unsigned cases.
+## Returns 0 (and prints nothing) for the annotated-signed case.
+require_annotated_signed_tag() {
+   local tag_ref="$1"
+   local context_label="$2"
+   local tag_objtype tag_body
+
+   if ! tag_objtype="$(git cat-file -t "${tag_ref}")"; then
+      die "cannot inspect tag ref '${tag_ref}' in ${context_label}"
+   fi
+
+   case "$tag_objtype" in
+      commit)
+         echo "${bold}${red}ERROR: Tag '${tag_ref}' in ${context_label} is a lightweight tag, not annotated${reset}" >&2
+         echo "${cyan}INFO: Lightweight tags have no tag object and cannot carry a signature. Release tags must be annotated signed tags ('git tag -a -s ...').${reset}" >&2
+         exit 2
+         ;;
+      tag)
+         ;;
+      *)
+         die "tag ref '${tag_ref}' resolves to unexpected object type '${tag_objtype}' in ${context_label}"
+         ;;
+   esac
+
+   ## Annotated. Check for a signature block in the tag object body.
+   if ! tag_body="$(git cat-file tag "${tag_ref}")"; then
+      die "cannot read tag object for '${tag_ref}' in ${context_label}"
+   fi
+   case "$tag_body" in
+      *'-----BEGIN PGP SIGNATURE-----'*|*'-----BEGIN PGP MESSAGE-----'*|*'-----BEGIN SSH SIGNATURE-----'*)
+         ## Signed (any recognized format). Accept.
+         ;;
+      *)
+         echo "${bold}${red}ERROR: Tag '${tag_ref}' in ${context_label} is annotated but unsigned${reset}" >&2
+         echo "${cyan}INFO: Release tags must be signed ('git tag -a -s ...'). Cryptographic verification of the tag signature is out of scope here - sq-git log authenticates the target commit instead - but the signature block must exist.${reset}" >&2
+         exit 2
+         ;;
+   esac
+}
+
 ## ----------------------------------------------------------------------------
 ## Modes
 ## ----------------------------------------------------------------------------
@@ -462,24 +526,25 @@ mode_working_tree() {
    sq_git_verify "${head}^{commit}" "${context} (commit ${head})" || exit 1
 
    ## 2. Tag hygiene check. Policy: a commit has either zero tags or
-   ## exactly one annotated tag.
+   ## exactly one annotated signed tag.
    ##
-   ## Rationale:
+   ## Rationale for "at most one tag":
    ## - makes release identity unambiguous (commit X = release Y, not
    ##   "maybe release Y or maybe release Z")
    ## - closes the bypass where an unsigned second tag on the same
    ##   commit as a signed release tag could slip past verification
    ##
-   ## NOTE: sq-git log cannot verify tag OBJECT signatures - it only
-   ## authenticates commit ranges. Earlier revisions of this script
-   ## tried 'sq-git log -- ${tag}^{tag}' hoping to verify annotated
-   ## tag signatures; that is unsupported by sq-git's design. The
-   ## target commit's authentication (step 1 above) is what actually
-   ## gates release trust. Tag hygiene here is:
-   ##   - at most one tag at the commit (ambiguity prevention)
-   ##   - the tag must be annotated, not lightweight (release hygiene;
-   ##     lightweight tags cannot carry metadata)
-   ## The tag OBJECT signature itself is not verified.
+   ## Three-way tag classification (via require_annotated_signed_tag):
+   ##   lightweight        -> die
+   ##   annotated-unsigned -> die
+   ##   annotated-signed   -> continue
+   ##
+   ## NOTE: sq-git log authenticates commit ranges, not tag objects.
+   ## The signature-block presence check in require_annotated_signed_tag
+   ## is a HYGIENE check (release tags must carry a signature), not a
+   ## cryptographic verification. The real release trust anchor is the
+   ## target commit's authentication in step 1 above; see the header
+   ## "Trust model" section.
    ##
    ## We use %(refname) not %(refname:short) to avoid branch/tag
    ## naming collisions when the value is fed back into git commands.
@@ -505,15 +570,7 @@ mode_working_tree() {
          fi
          ;;
       1)
-         tag_refname="${tags_at_head[0]}"
-         if ! tag_objtype="$(git cat-file -t "${tag_refname}")"; then
-            die "cannot inspect tag '${tag_refname}' in ${context}"
-         fi
-         if [ "$tag_objtype" != "tag" ]; then
-            echo "${bold}${red}ERROR: Tag '${tag_refname}' in ${context} is a lightweight tag, not annotated${reset}" >&2
-            echo "${cyan}INFO: Release tags must be annotated ('git tag -a') so they carry metadata. Remove the lightweight tag or recreate it as annotated.${reset}" >&2
-            exit 2
-         fi
+         require_annotated_signed_tag "${tags_at_head[0]}" "${context}"
          ;;
       *)
          echo "${bold}${red}ERROR: Multiple tags point at HEAD in ${context}: ${tags_at_head[*]}${reset}" >&2
@@ -558,37 +615,30 @@ mode_ref() {
       *) die "--ref-type must be 'tag' or 'commit'" ;;
    esac
 
-   local resolve_ref ref_commit ref_objtype
+   local resolve_ref ref_commit
 
-   ## For --ref-type tag, force resolution under 'refs/tags/' so that:
-   ##   - a branch / raw commit / ambiguous short name cannot be mistaken
-   ##     for a tag
-   ##   - the tag must actually exist in the local repo under refs/tags/
-   ##   - 'git cat-file -t' below operates on the tag ref, not on an
-   ##     ambiguous short name
+   ## For --ref-type tag:
+   ##   - Normalize to a fully qualified 'refs/tags/...' ref. Callers
+   ##     may pass either a short tag name ('v1.2.3') or the fully
+   ##     qualified form ('refs/tags/v1.2.3'); both are accepted.
+   ##   - Refnames under refs/ that are NOT under refs/tags/ are
+   ##     rejected (they cannot be tags).
+   ##   - Require the ref to exist under refs/tags/.
+   ##   - Require the tag to be annotated-and-signed via
+   ##     require_annotated_signed_tag (three-way classification:
+   ##     lightweight/annotated-unsigned/annotated-signed).
+   ##
    ## For --ref-type commit, accept any valid commit-ish (branch name,
-   ## commit SHA, etc.).
+   ## commit SHA, etc.) and skip the tag classification.
    if [ "$ref_type" = 'tag' ]; then
-      resolve_ref="refs/tags/${ref}"
+      case "$ref" in
+         refs/tags/*)  resolve_ref="$ref" ;;
+         refs/*)       die "ref '${ref}' is declared as --ref-type tag but is not under refs/tags/" ;;
+         *)            resolve_ref="refs/tags/${ref}" ;;
+      esac
       git show-ref --verify --quiet "${resolve_ref}" \
          || die "tag ref not found under refs/tags/: '${ref}'"
-      if ! ref_objtype="$(git cat-file -t "${resolve_ref}")"; then
-         die "cannot inspect tag ref '${resolve_ref}'"
-      fi
-      ## Enforce that the tag is annotated (has a tag object).
-      ## Lightweight tags cannot carry metadata and are inappropriate
-      ## for release identification.
-      ##
-      ## NOTE: sq-git log authenticates commit ranges, not tag objects -
-      ## so we cannot cryptographically verify the tag object signature
-      ## here. --ref-type tag's guarantee over --ref-type commit is:
-      ##   - the ref exists under refs/tags/
-      ##   - the tag is annotated (has a tag object)
-      ## Release trust itself still comes from authenticating the tag's
-      ## TARGET commit below.
-      if [ "$ref_objtype" != "tag" ]; then
-         die "ref '${ref}' was declared as --ref-type tag but is not an annotated tag (cat-file type: ${ref_objtype})"
-      fi
+      require_annotated_signed_tag "${resolve_ref}" "ref '${ref}'"
    else
       resolve_ref="${ref}"
    fi
@@ -598,10 +648,9 @@ mode_ref() {
       die "could not resolve ref '${ref}' to a commit"
    fi
 
-   ## Authenticate the target commit via sq-git log.
-   ## When sq_git_trust_root == ref_commit, sq-git log authenticates
-   ## the single-commit 'chain' trivially (TOFU); see
-   ## 'mode_working_tree' for details.
+   ## Authenticate the target commit via sq-git log. When
+   ## sq_git_trust_root == ref_commit, sq-git log authenticates the
+   ## single-commit 'chain' trivially; see 'mode_working_tree'.
    sq_git_verify "${ref_commit}" "ref '${ref}' (commit ${ref_commit})" || exit 1
 }
 
@@ -617,26 +666,23 @@ mode_submodules() {
    ## We re-invoke this script (under bash) per submodule to keep strict
    ## shell options and shared verification logic.
    ##
-   ## '$toplevel' is safe for nested submodules: git sets it via xgetcwd()
-   ## at foreach start, so it always points to the root superproject.
-   ## https://github.com/git/git/blob/master/builtin/submodule--helper.c
-   ## (function runcommand_in_submodule_cb: toplevel = xgetcwd())
+   ## Helper path: use '$MYDIR' (the absolute path to THIS script's
+   ## directory, computed at startup from $BASH_SOURCE). Earlier
+   ## revisions used '$(git rev-parse --show-toplevel)/help-steps/...'
+   ## which broke when the caller ran the script from inside a
+   ## nested git repo (e.g. a submodule) - '--show-toplevel' then
+   ## points at the nested repo, which doesn't contain this helper.
+   ## $MYDIR always points at this script's own directory regardless
+   ## of the caller's cwd.
    ##
-   ## Sanity-check that we can find this script in the superproject's
-   ## 'help-steps/' directory before invoking foreach. If the top-level
-   ## layout does not match, fail here with a clear error instead of a
-   ## confusing 'bash: ...git_sanity_test: No such file or directory'
-   ## inside each submodule.
-   local top_helper
-   top_helper="$(git rev-parse --show-toplevel)/help-steps/git_sanity_test"
-   ## Use '[ -r ]' not '[ -x ]' - we invoke the helper as 'bash
-   ## "$top_helper"' which only needs read permission on the file;
-   ## the execute bit on the file itself is not consulted.
-   [ -r "${top_helper}" ] || die "helper script not found or not readable at superproject path: '${top_helper}'"
+   ## We export MYDIR so the foreach subshell (POSIX sh) can expand it.
+   ## '$displaypath' is set by 'git submodule foreach' itself.
+   [ -r "${MYDIR}/git_sanity_test" ] || die "helper script not found or not readable: '${MYDIR}/git_sanity_test'"
 
+   export MYDIR
    sq_git_trust_root=HEAD \
       git submodule foreach --recursive \
-         'bash "$toplevel/help-steps/git_sanity_test" --mode working-tree --context "$displaypath"'
+         'bash "$MYDIR/git_sanity_test" --mode working-tree --context "$displaypath"'
 }
 
 mode_all() {
