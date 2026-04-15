@@ -25,25 +25,39 @@
 ##     Verify the current working directory's git repo:
 ##       1. Authenticate HEAD commit against sq_git_trust_root via
 ##          'sq-git log' (walks the commit chain, validates each
-##          commit signature against openpgp-policy.toml).
-##       2. Tag hygiene: at most one tag at HEAD, and it must be
-##          annotated (not lightweight). The tag OBJECT signature is
-##          NOT verified; sq-git log authenticates commit ranges, not
-##          tag objects. Release trust rests on the target commit's
-##          authentication (step 1).
-##       3. Untagged commit check.
-##       4. Uncommitted changes check.
-##     Exit codes: 0=ok, 1=signature, 2=untagged, 3=uncommitted
+##          commit signature against openpgp-policy.toml). This is
+##          the cryptographic trust gate.
+##       2. Tag policy. The only valid tag states for this repo are:
+##            A) no tag at HEAD        (allowed under --allow-untagged)
+##            B) exactly one annotated SIGNED tag at HEAD
+##          Everything else is a hard error, regardless of
+##          --allow-untagged:
+##            - lightweight tag at HEAD
+##            - annotated but unsigned tag at HEAD
+##            - multiple tags at HEAD
+##          --allow-untagged is a narrow escape hatch for case A only;
+##          it means "it is OK that there is NO tag here" and not "it
+##          is OK that tag state is broken". sq-git log authenticates
+##          commit ranges, not tag objects, so the tag-state check is
+##          release-workflow HYGIENE rather than cryptographic
+##          verification. See the inline block comment in
+##          mode_working_tree for the full rationale.
+##       3. Uncommitted changes check.
+##     Exit codes: 0=ok, 1=signature, 2=tag/untagged, 3=uncommitted
 ##
 ##   --mode ref --ref REF --ref-type {tag|commit}
 ##     Authenticate a specific ref's target commit.
 ##     - Resolves REF to a commit (tag -> its target commit).
 ##     - Authenticates that commit via 'sq-git log' from the trust
 ##       root, the same as --mode working-tree step 1.
-##     - For --ref-type tag, additionally requires REF to be an
-##       annotated tag (hygiene check via 'git cat-file -t'). The
-##       tag object signature is NOT cryptographically verified;
-##       see the note under --mode working-tree above.
+##     - For --ref-type tag: REF must exist under refs/tags/, and
+##       the tag must be annotated-and-signed per the three-way
+##       classify_tag check. --allow-untagged is NOT honoured here -
+##       when the caller explicitly names a specific ref and declares
+##       its type, they mean it, and the declaration is enforced
+##       strictly. A caller who wants to build from a commit without
+##       tag enforcement should use --mode working-tree with
+##       --allow-untagged instead.
 ##     Exit codes: 0=ok, 1=verification failed
 ##
 ##   --mode submodules
@@ -89,18 +103,28 @@
 ##     verified) pins each submodule commit.
 ##
 ##   dist_build_ignore_untagged
-##     REQUIRED. "true" or "false". Controls the tag-hygiene escape hatch
-##     in --mode working-tree. When "true", ALL tag-hygiene failures are
-##     bypassed with an INFO message:
-##       - untagged commit (no tag at HEAD)
-##       - lightweight tag at HEAD (no tag object)
-##       - annotated but unsigned tag at HEAD
-##       - multiple tags at HEAD
-##     sq-git log commit authentication (the cryptographic gate) still
-##     runs. --mode ref does NOT honour this setting: when the caller
-##     explicitly asks for --ref-type tag, they mean it.
-##     Set by 'help-steps/parse-cmd' from --allow-untagged; defaulted to
-##     "false" by 'help-steps/variables' otherwise.
+##     REQUIRED. "true" or "false". Narrow escape hatch for --mode
+##     working-tree that covers ONE failure mode only:
+##       - "no tag at HEAD" (i.e. building from a non-release commit)
+##     When "true", that case passes with an INFO message.
+##
+##     It does NOT cover any other tag-hygiene failure. By policy
+##     (documented in mode_working_tree), the only VALID tag states in
+##     this repo are (A) no tag at HEAD or (B) exactly one annotated
+##     signed tag at HEAD. Lightweight tags, annotated-unsigned tags,
+##     and multiple tags at HEAD are unconditional errors regardless
+##     of --allow-untagged - they represent repo-hygiene bugs that
+##     must be fixed, not bypassed.
+##
+##     sq-git log commit authentication (the cryptographic gate) runs
+##     in all cases and is never affected by this setting.
+##
+##     --mode ref does not consult this variable at all: when the
+##     caller explicitly names a ref and declares its type, they mean
+##     it, and we enforce the declaration strictly.
+##
+##     Set by 'help-steps/parse-cmd' from --allow-untagged; defaulted
+##     to "false" by 'help-steps/variables' otherwise.
 ##
 ##   dist_build_ignore_uncommitted
 ##     REQUIRED. "true" or "false". Whether to skip the uncommitted check.
@@ -572,23 +596,44 @@ mode_working_tree() {
    ## 2. Tag hygiene check. Policy: a commit has either zero tags or
    ## exactly one annotated signed tag.
    ##
-   ## Rationale for "at most one tag":
-   ## - makes release identity unambiguous (commit X = release Y, not
-   ##   "maybe release Y or maybe release Z")
-   ## - closes the bypass where an unsigned second tag on the same
-   ##   commit as a signed release tag could slip past verification
+   ## 2. Tag policy check.
    ##
-   ## Three-way tag classification (via require_annotated_signed_tag):
-   ##   lightweight        -> die
-   ##   annotated-unsigned -> die
-   ##   annotated-signed   -> continue
+   ## Strict tag policy: the only VALID tag states for a derivative-
+   ## maker checkout are:
    ##
-   ## NOTE: sq-git log authenticates commit ranges, not tag objects.
-   ## The signature-block presence check in require_annotated_signed_tag
-   ## is a HYGIENE check (release tags must carry a signature), not a
-   ## cryptographic verification. The real release trust anchor is the
-   ## target commit's authentication in step 1 above; see the header
-   ## "Trust model" section.
+   ##   A) no tag at HEAD        (allowed under --allow-untagged)
+   ##   B) exactly one annotated signed tag at HEAD
+   ##
+   ## Any other state is a POLICY VIOLATION and errors out
+   ## unconditionally, regardless of --allow-untagged:
+   ##
+   ##   - lightweight tag at HEAD
+   ##       Lightweight tags have no tag object, cannot carry a
+   ##       signature, and are not permitted anywhere in this repo.
+   ##       (Even as a local bookmark.) If you need a local bookmark,
+   ##       use a branch.
+   ##
+   ##   - annotated-unsigned tag at HEAD
+   ##       All tags in this repo must be signed. An annotated tag
+   ##       without a signature block is a mistake or an attempt to
+   ##       smuggle a release-like name past the check.
+   ##
+   ##   - multiple tags at HEAD
+   ##       Release identity must be unambiguous. One commit = one
+   ##       tag, no exceptions.
+   ##
+   ## Why --allow-untagged does NOT cover the lightweight/unsigned/
+   ## multiple cases:
+   ##   --allow-untagged is a narrow escape hatch for "I am building
+   ##   from a commit that is not a release". It means "it is OK that
+   ##   there is NO tag here". It does NOT mean "it is OK that tag
+   ##   state is broken" - broken tag state is a repo-hygiene bug
+   ##   that should be fixed (remove the offending tag, or create a
+   ##   proper annotated signed one), not bypassed.
+   ##
+   ## sq-git log commit authentication (step 1 above) is the
+   ## CRYPTOGRAPHIC gate and runs in all cases. This tag check is
+   ## release-workflow HYGIENE that enforces the invariant above.
    ##
    ## We use %(refname) not %(refname:short) to avoid branch/tag
    ## naming collisions when the value is fed back into git commands.
@@ -602,55 +647,51 @@ mode_working_tree() {
       tags_at_head=()
    fi
 
-   ## Tag-hygiene failure dispatch.
-   ##
-   ## '--allow-untagged true' is the general escape hatch for "I'm not
-   ## building from a proper release state". It bypasses every tag-
-   ## hygiene failure mode here (no tag, lightweight tag, unsigned tag,
-   ## multiple tags), not just the literally-untagged case - a developer
-   ## with a lightweight local bookmark at HEAD should not need to
-   ## delete it just to run a non-release build.
-   ##
-   ## Release builds should have exactly one annotated signed tag at
-   ## HEAD and should NOT pass --allow-untagged.
-   local tag_status=0
-   local tag_reason=""
    case "${#tags_at_head[@]}" in
       0)
-         tag_status=1
-         tag_reason="Untagged commit in: ${context}"
+         ## No tag at HEAD. This is the ONLY case --allow-untagged
+         ## covers.
+         if [ "${dist_build_ignore_untagged}" = "true" ]; then
+            echo "${cyan}INFO: Untagged commit in ${context}, --allow-untagged set, continuing.${reset}"
+         else
+            echo "${bold}${red}ERROR: Untagged commit in: ${context}${reset}" >&2
+            print_allow_hint
+            echo "${cyan}INFO: See build documentation on how to verify and checkout git tags.${reset}" >&2
+            exit 2
+         fi
          ;;
       1)
+         ## Exactly one tag at HEAD. Must be annotated+signed.
+         ## --allow-untagged is NOT honoured here (see block comment
+         ## above).
          local cls=0
          classify_tag "${tags_at_head[0]}" "${context}" || cls=$?
          case "$cls" in
-            0) : ;; ## annotated-signed: accept
+            0)
+               ## annotated-signed: accept
+               ;;
             1)
-               tag_status=1
-               tag_reason="Tag '${tags_at_head[0]}' in ${context} is a lightweight tag (no tag object, cannot carry a signature)"
+               echo "${bold}${red}ERROR: Tag '${tags_at_head[0]}' in ${context} is a lightweight tag${reset}" >&2
+               echo "${cyan}INFO: Lightweight tags have no tag object and cannot carry a signature. Policy: all tags in this repo must be annotated signed tags. Remove the tag ('git tag -d ...') or recreate it as annotated and signed ('git tag -a -s ...'). If you need a local bookmark, use a branch instead.${reset}" >&2
+               echo "${cyan}INFO: --allow-untagged does NOT bypass this check - it only covers the 'no tag at all' case.${reset}" >&2
+               exit 2
                ;;
             2)
-               tag_status=1
-               tag_reason="Tag '${tags_at_head[0]}' in ${context} is annotated but unsigned"
+               echo "${bold}${red}ERROR: Tag '${tags_at_head[0]}' in ${context} is annotated but unsigned${reset}" >&2
+               echo "${cyan}INFO: Policy: all tags in this repo must be signed. Recreate the tag with 'git tag -a -s ...' (or '-u <key>' for a specific signer).${reset}" >&2
+               echo "${cyan}INFO: --allow-untagged does NOT bypass this check - it only covers the 'no tag at all' case.${reset}" >&2
+               exit 2
                ;;
          esac
          ;;
       *)
-         tag_status=1
-         tag_reason="Multiple tags point at HEAD in ${context}: ${tags_at_head[*]}"
+         ## Multiple tags at HEAD. --allow-untagged is NOT honoured.
+         echo "${bold}${red}ERROR: Multiple tags point at HEAD in ${context}: ${tags_at_head[*]}${reset}" >&2
+         echo "${cyan}INFO: Policy: at most one tag per commit so release identity is unambiguous. Remove the extras with 'git tag -d ...'.${reset}" >&2
+         echo "${cyan}INFO: --allow-untagged does NOT bypass this check - it only covers the 'no tag at all' case.${reset}" >&2
+         exit 2
          ;;
    esac
-
-   if [ "$tag_status" != "0" ]; then
-      if [ "${dist_build_ignore_untagged}" = "true" ]; then
-         echo "${cyan}INFO: ${tag_reason}; --allow-untagged set, continuing.${reset}"
-      else
-         echo "${bold}${red}ERROR: ${tag_reason}${reset}" >&2
-         print_allow_hint
-         echo "${cyan}INFO: Release tags must be annotated signed tags ('git tag -a -s ...'). At most one tag per commit.${reset}" >&2
-         exit 2
-      fi
-   fi
 
    ## 3. Uncommitted changes check.
    ##
