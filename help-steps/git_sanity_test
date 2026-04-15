@@ -482,53 +482,31 @@ print_allow_hint() {
 ##
 ##    lightweight        - no tag object at all (ref points directly at a
 ##                         commit). Cannot carry a signature by definition.
-##    annotated-unsigned - tag object exists but has no PGP signature block.
+##    annotated-unsigned - tag object exists but has no PGP signature block
+##                         (per a substring check on the tag body).
 ##    annotated-signed   - tag object exists and contains a PGP signature
 ##                         block.
 ##
-## Returns 0 for annotated-signed. Returns a non-zero status (caller
-## decides what to do) for lightweight and annotated-unsigned, with the
-## failing type written to ${__ast_fail_reason} via nameref so callers
-## can emit mode-specific error messages or bypass the check under
-## --allow-untagged.
+## Exit status semantics (the caller decides what to do):
+##    0 - annotated-signed
+##    1 - lightweight
+##    2 - annotated-unsigned
+##    (die() on internal errors like 'cannot inspect tag')
 ##
-## WHY THIS CHECK EXISTS (release hygiene, not cryptographic security):
+## This is RELEASE-WORKFLOW HYGIENE, not cryptographic verification. See
+## 'security.md' in the repo root for the full analysis: threat model,
+## spoof attempts, alternative options, and why we do not use
+## 'git tag -v' / 'sq verify' here. The short version:
 ##
-## sq-git log authenticates commit ranges. It does NOT classify tags or
-## verify tag object signatures. If passed a lightweight tag name, it
-## silently resolves to the tag's target commit and verifies the commit
-## chain as if the tag name had been the commit SHA all along:
-##
-##    $ git tag del                             # lightweight
-##    $ git tag -v del
-##    error: del: cannot verify a non-tag object of type commit.
-##    $ sq-git log --trust-root HEAD del
-##    Verified that there is an authenticated path from the trust root
-##    bf034a8f... to bf034a8f...
-##
-## (demonstration by Patrick Schleizer on Debian trixie sequoia-git
-## 0.4.0-4+b5, Dec 2025)
-##
-## Without this helper, a lightweight tag pointing at a signed release
-## commit would pass 'sq-git log' verification and then be treated as
-## "the release tag" by downstream tooling - even though it carries no
-## tag-object metadata and no signature at all. That is a release-
-## workflow bug, not a cryptographic bypass (the commit itself is still
-## authenticated), but it is exactly the kind of mistake a release-
-## infrastructure sanity check should catch.
-##
-## Signature detection for annotated tags is a PRESENCE check (grep for
-## a PGP/SSH signature block in 'git cat-file tag' output), NOT a
-## cryptographic verification. Real release trust rests on the target
-## commit's sq-git authentication; this helper enforces the workflow
-## invariant "release tags are annotated signed tags".
-##
-## Takes a fully qualified tag ref (e.g. 'refs/tags/v1.0') and a
-## context label for error messages. Exit status semantics:
-##   0 - annotated-signed
-##   1 - lightweight
-##   2 - annotated-unsigned
-##   (die() on internal errors like 'cannot inspect tag')
+##   - sq-git log authenticates COMMITS, not tag objects. A lightweight
+##     tag at HEAD silently passes sq-git log because it resolves to the
+##     signed target commit.
+##   - The substring signature-presence check below is SPOOFABLE by a
+##     tag message that contains the BEGIN marker text. It catches
+##     honest-developer "forgot -s" mistakes and not much else.
+##   - The real release trust anchor is sq-git log on the target commit
+##     (see mode_working_tree step 1). The tag check exists to catch
+##     workflow mistakes, not to provide cryptographic guarantees.
 classify_tag() {
    local tag_ref="$1"
    local context_label="$2"
@@ -572,7 +550,7 @@ classify_tag() {
 mode_working_tree() {
    [ -n "$context" ] || die "--context is required for --mode working-tree"
 
-   local head git_status git_tags_output tag_refname tag_objtype
+   local head git_status git_tags_output
    local -a tags_at_head git_tags_cmd
 
    head="$(git rev-parse HEAD)" || die "Failed to get HEAD for: ${context}"
@@ -593,9 +571,6 @@ mode_working_tree() {
    ## than walk-based; see the "TOFU model" block in the header.
    sq_git_verify "${head}^{commit}" "${context} (commit ${head})" || exit 1
 
-   ## 2. Tag hygiene check. Policy: a commit has either zero tags or
-   ## exactly one annotated signed tag.
-   ##
    ## 2. Tag policy check.
    ##
    ## Strict tag policy: the only VALID tag states for a derivative-
@@ -608,32 +583,22 @@ mode_working_tree() {
    ## unconditionally, regardless of --allow-untagged:
    ##
    ##   - lightweight tag at HEAD
-   ##       Lightweight tags have no tag object, cannot carry a
-   ##       signature, and are not permitted anywhere in this repo.
-   ##       (Even as a local bookmark.) If you need a local bookmark,
-   ##       use a branch.
-   ##
-   ##   - annotated-unsigned tag at HEAD
-   ##       All tags in this repo must be signed. An annotated tag
-   ##       without a signature block is a mistake or an attempt to
-   ##       smuggle a release-like name past the check.
-   ##
+   ##   - annotated but unsigned tag at HEAD
    ##   - multiple tags at HEAD
-   ##       Release identity must be unambiguous. One commit = one
-   ##       tag, no exceptions.
    ##
-   ## Why --allow-untagged does NOT cover the lightweight/unsigned/
-   ## multiple cases:
-   ##   --allow-untagged is a narrow escape hatch for "I am building
-   ##   from a commit that is not a release". It means "it is OK that
-   ##   there is NO tag here". It does NOT mean "it is OK that tag
-   ##   state is broken" - broken tag state is a repo-hygiene bug
-   ##   that should be fixed (remove the offending tag, or create a
-   ##   proper annotated signed one), not bypassed.
+   ## --allow-untagged is a narrow escape hatch for case A ONLY. It
+   ## means "it is OK that there is NO tag here", not "it is OK that
+   ## tag state is broken". Broken tag state is a repo-hygiene bug
+   ## that must be fixed (remove the offending tag, or create a
+   ## proper annotated signed one), not bypassed.
    ##
    ## sq-git log commit authentication (step 1 above) is the
-   ## CRYPTOGRAPHIC gate and runs in all cases. This tag check is
-   ## release-workflow HYGIENE that enforces the invariant above.
+   ## CRYPTOGRAPHIC trust gate and runs in all cases. This tag check
+   ## is release-workflow HYGIENE on top.
+   ##
+   ## For the full threat model, spoof analysis, and discussion of
+   ## alternative designs (git tag -v, sq verify, %(contents:signature),
+   ## replay attacks, etc.) see 'security.md' in the repo root.
    ##
    ## We use %(refname) not %(refname:short) to avoid branch/tag
    ## naming collisions when the value is fed back into git commands.
