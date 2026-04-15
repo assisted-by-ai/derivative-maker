@@ -89,7 +89,16 @@
 ##     verified) pins each submodule commit.
 ##
 ##   dist_build_ignore_untagged
-##     REQUIRED. "true" or "false". Whether to skip the untagged check.
+##     REQUIRED. "true" or "false". Controls the tag-hygiene escape hatch
+##     in --mode working-tree. When "true", ALL tag-hygiene failures are
+##     bypassed with an INFO message:
+##       - untagged commit (no tag at HEAD)
+##       - lightweight tag at HEAD (no tag object)
+##       - annotated but unsigned tag at HEAD
+##       - multiple tags at HEAD
+##     sq-git log commit authentication (the cryptographic gate) still
+##     runs. --mode ref does NOT honour this setting: when the caller
+##     explicitly asks for --ref-type tag, they mean it.
 ##     Set by 'help-steps/parse-cmd' from --allow-untagged; defaulted to
 ##     "false" by 'help-steps/variables' otherwise.
 ##
@@ -451,15 +460,52 @@ print_allow_hint() {
 ##                         commit). Cannot carry a signature by definition.
 ##    annotated-unsigned - tag object exists but has no PGP signature block.
 ##    annotated-signed   - tag object exists and contains a PGP signature
-##                         block. (Cryptographic verification of the
-##                         signature is NOT performed here - sq-git log
-##                         authenticates the target commit instead; see
-##                         the header "Trust model" section.)
+##                         block.
 ##
-## Takes a fully qualified tag ref (e.g. 'refs/tags/v1.0') and dies with
-## a clear error for the lightweight and annotated-unsigned cases.
-## Returns 0 (and prints nothing) for the annotated-signed case.
-require_annotated_signed_tag() {
+## Returns 0 for annotated-signed. Returns a non-zero status (caller
+## decides what to do) for lightweight and annotated-unsigned, with the
+## failing type written to ${__ast_fail_reason} via nameref so callers
+## can emit mode-specific error messages or bypass the check under
+## --allow-untagged.
+##
+## WHY THIS CHECK EXISTS (release hygiene, not cryptographic security):
+##
+## sq-git log authenticates commit ranges. It does NOT classify tags or
+## verify tag object signatures. If passed a lightweight tag name, it
+## silently resolves to the tag's target commit and verifies the commit
+## chain as if the tag name had been the commit SHA all along:
+##
+##    $ git tag del                             # lightweight
+##    $ git tag -v del
+##    error: del: cannot verify a non-tag object of type commit.
+##    $ sq-git log --trust-root HEAD del
+##    Verified that there is an authenticated path from the trust root
+##    bf034a8f... to bf034a8f...
+##
+## (demonstration by Patrick Schleizer on Debian trixie sequoia-git
+## 0.4.0-4+b5, Dec 2025)
+##
+## Without this helper, a lightweight tag pointing at a signed release
+## commit would pass 'sq-git log' verification and then be treated as
+## "the release tag" by downstream tooling - even though it carries no
+## tag-object metadata and no signature at all. That is a release-
+## workflow bug, not a cryptographic bypass (the commit itself is still
+## authenticated), but it is exactly the kind of mistake a release-
+## infrastructure sanity check should catch.
+##
+## Signature detection for annotated tags is a PRESENCE check (grep for
+## a PGP/SSH signature block in 'git cat-file tag' output), NOT a
+## cryptographic verification. Real release trust rests on the target
+## commit's sq-git authentication; this helper enforces the workflow
+## invariant "release tags are annotated signed tags".
+##
+## Takes a fully qualified tag ref (e.g. 'refs/tags/v1.0') and a
+## context label for error messages. Exit status semantics:
+##   0 - annotated-signed
+##   1 - lightweight
+##   2 - annotated-unsigned
+##   (die() on internal errors like 'cannot inspect tag')
+classify_tag() {
    local tag_ref="$1"
    local context_label="$2"
    local tag_objtype tag_body
@@ -470,9 +516,8 @@ require_annotated_signed_tag() {
 
    case "$tag_objtype" in
       commit)
-         echo "${bold}${red}ERROR: Tag '${tag_ref}' in ${context_label} is a lightweight tag, not annotated${reset}" >&2
-         echo "${cyan}INFO: Lightweight tags have no tag object and cannot carry a signature. Release tags must be annotated signed tags ('git tag -a -s ...').${reset}" >&2
-         exit 2
+         ## lightweight
+         return 1
          ;;
       tag)
          ;;
@@ -481,18 +526,17 @@ require_annotated_signed_tag() {
          ;;
    esac
 
-   ## Annotated. Check for a signature block in the tag object body.
    if ! tag_body="$(git cat-file tag "${tag_ref}")"; then
       die "cannot read tag object for '${tag_ref}' in ${context_label}"
    fi
    case "$tag_body" in
       *'-----BEGIN PGP SIGNATURE-----'*|*'-----BEGIN PGP MESSAGE-----'*|*'-----BEGIN SSH SIGNATURE-----'*)
-         ## Signed (any recognized format). Accept.
+         ## annotated-signed
+         return 0
          ;;
       *)
-         echo "${bold}${red}ERROR: Tag '${tag_ref}' in ${context_label} is annotated but unsigned${reset}" >&2
-         echo "${cyan}INFO: Release tags must be signed ('git tag -a -s ...'). Cryptographic verification of the tag signature is out of scope here - sq-git log authenticates the target commit instead - but the signature block must exist.${reset}" >&2
-         exit 2
+         ## annotated-unsigned
+         return 2
          ;;
    esac
 }
@@ -558,26 +602,55 @@ mode_working_tree() {
       tags_at_head=()
    fi
 
+   ## Tag-hygiene failure dispatch.
+   ##
+   ## '--allow-untagged true' is the general escape hatch for "I'm not
+   ## building from a proper release state". It bypasses every tag-
+   ## hygiene failure mode here (no tag, lightweight tag, unsigned tag,
+   ## multiple tags), not just the literally-untagged case - a developer
+   ## with a lightweight local bookmark at HEAD should not need to
+   ## delete it just to run a non-release build.
+   ##
+   ## Release builds should have exactly one annotated signed tag at
+   ## HEAD and should NOT pass --allow-untagged.
+   local tag_status=0
+   local tag_reason=""
    case "${#tags_at_head[@]}" in
       0)
-         if [ "${dist_build_ignore_untagged}" = "true" ]; then
-            echo "${cyan}INFO: Untagged commit in ${context}, --allow-untagged set, continuing.${reset}"
-         else
-            echo "${bold}${red}ERROR: Untagged commit in: ${context}${reset}" >&2
-            print_allow_hint
-            echo "${cyan}INFO: See build documentation on how to verify and checkout git tags.${reset}" >&2
-            exit 2
-         fi
+         tag_status=1
+         tag_reason="Untagged commit in: ${context}"
          ;;
       1)
-         require_annotated_signed_tag "${tags_at_head[0]}" "${context}"
+         local cls=0
+         classify_tag "${tags_at_head[0]}" "${context}" || cls=$?
+         case "$cls" in
+            0) : ;; ## annotated-signed: accept
+            1)
+               tag_status=1
+               tag_reason="Tag '${tags_at_head[0]}' in ${context} is a lightweight tag (no tag object, cannot carry a signature)"
+               ;;
+            2)
+               tag_status=1
+               tag_reason="Tag '${tags_at_head[0]}' in ${context} is annotated but unsigned"
+               ;;
+         esac
          ;;
       *)
-         echo "${bold}${red}ERROR: Multiple tags point at HEAD in ${context}: ${tags_at_head[*]}${reset}" >&2
-         echo "${cyan}INFO: Policy requires at most one tag per commit. Remove the extras before building.${reset}" >&2
-         exit 2
+         tag_status=1
+         tag_reason="Multiple tags point at HEAD in ${context}: ${tags_at_head[*]}"
          ;;
    esac
+
+   if [ "$tag_status" != "0" ]; then
+      if [ "${dist_build_ignore_untagged}" = "true" ]; then
+         echo "${cyan}INFO: ${tag_reason}; --allow-untagged set, continuing.${reset}"
+      else
+         echo "${bold}${red}ERROR: ${tag_reason}${reset}" >&2
+         print_allow_hint
+         echo "${cyan}INFO: Release tags must be annotated signed tags ('git tag -a -s ...'). At most one tag per commit.${reset}" >&2
+         exit 2
+      fi
+   fi
 
    ## 3. Uncommitted changes check.
    ##
@@ -624,9 +697,15 @@ mode_ref() {
    ##   - Refnames under refs/ that are NOT under refs/tags/ are
    ##     rejected (they cannot be tags).
    ##   - Require the ref to exist under refs/tags/.
-   ##   - Require the tag to be annotated-and-signed via
-   ##     require_annotated_signed_tag (three-way classification:
-   ##     lightweight/annotated-unsigned/annotated-signed).
+   ##   - Require the tag to be annotated-and-signed via classify_tag
+   ##     (three-way: lightweight / annotated-unsigned / annotated-signed).
+   ##
+   ## NOTE: '--allow-untagged' is NOT honoured here. --mode ref is an
+   ## explicit "verify this specific ref of this specific type" request
+   ## from the caller; if the caller asked for --ref-type tag, they
+   ## mean it. --allow-untagged only bypasses the tag-hygiene checks
+   ## in --mode working-tree (which is where the "I'm building from
+   ## non-release state" escape hatch makes sense).
    ##
    ## For --ref-type commit, accept any valid commit-ish (branch name,
    ## commit SHA, etc.) and skip the tag classification.
@@ -638,7 +717,13 @@ mode_ref() {
       esac
       git show-ref --verify --quiet "${resolve_ref}" \
          || die "tag ref not found under refs/tags/: '${ref}'"
-      require_annotated_signed_tag "${resolve_ref}" "ref '${ref}'"
+      local cls=0
+      classify_tag "${resolve_ref}" "ref '${ref}'" || cls=$?
+      case "$cls" in
+         0) : ;;
+         1) die "ref '${ref}' (resolved to ${resolve_ref}) is a lightweight tag - not an annotated signed tag" ;;
+         2) die "ref '${ref}' (resolved to ${resolve_ref}) is annotated but unsigned - release tags must be signed" ;;
+      esac
    else
       resolve_ref="${ref}"
    fi
