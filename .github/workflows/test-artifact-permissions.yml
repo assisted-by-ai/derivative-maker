@@ -1,0 +1,49 @@
+---
+name: test-artifact-permissions
+
+## Empirical test: does actions/upload-artifact@v7 work under
+## permissions: { contents: read } only, or does it need actions: write?
+## Two parallel jobs with different permissions blocks. Compare the
+## job conclusions to know whether the run_automated_builder.yml
+## workflow needs an explicit actions: write when org default
+## workflow permissions are flipped to read-only.
+##
+## Runs on push to this branch only - won't fire on master or
+## anywhere else. Delete the file (and the branch) when the answer
+## is recorded.
+
+on:
+  push:
+    branches:
+      - test/artifact-permissions
+  workflow_dispatch:
+
+jobs:
+  readonly:
+    name: upload-artifact with contents=read only
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Create test file
+        run: echo "readonly job" > test-readonly.txt
+      - name: Upload artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: test-readonly
+          path: test-readonly.txt
+
+  actions-write:
+    name: upload-artifact with contents=read + actions=write
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      actions: write
+    steps:
+      - name: Create test file
+        run: echo "actions-write job" > test-actions-write.txt
+      - name: Upload artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: test-actions-write
+          path: test-actions-write.txt
