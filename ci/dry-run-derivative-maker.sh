@@ -39,29 +39,10 @@ fi
 
 cd -- "$(dirname -- "$(readlink -f -- "${BASH_SOURCE[0]}")")/.."
 
-## Pre-set 'user_name=builder' for help-steps/variables. The script's
-## own user-detection precedence (1: caller-provided user_name, 2:
-## $SUDO_USER, 3: logname, 4: whoami) honors a pre-set 'user_name'
-## first, so this short-circuits the SUDO_USER fallback.
-##
-## Why this matters in CI: 'run-as-user' invokes the build via
-## 'sudo -u builder ...' from root, which makes sudo set
-## SUDO_USER=root inside the build. Without this short-circuit,
-## variables would set HOMEVAR=/home/root - a nonexistent directory
-## not writable by the 'builder' user - and downstream 'mkdir -p
-## /home/root/derivative-binary' fails. variables already documents
-## this exact pitfall ("HOMEVAR=/home/root would silently point at
-## a nonexistent home directory") for the whoami branch but not for
-## SUDO_USER. Setting user_name explicitly is the simplest fix and
-## keeps the shared build logic untouched.
-##
-## 'env -' would over-strip; we want to keep PATH (and the rest)
-## that the harness set up. Use 'env VAR=val ...' to inject the
-## variable into the command's environment.
 timeout 1200 \
   ./help-steps/run-as-user --chown "$PWD" -- \
     builder \
-    env user_name=builder ./derivative-maker \
+    ./derivative-maker \
       --dry-run true \
       --unsupported-os true \
       --allow-uncommitted true \

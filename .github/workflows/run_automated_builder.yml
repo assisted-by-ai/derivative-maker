@@ -4,10 +4,10 @@ name: Run automated builder
 on:
   pull_request:
     branches: [master]
+  ## Branch-push triggers intentionally omitted: a tag-bearing commit
+  ## landing on master would otherwise fire this workflow twice. Tag
+  ## pushes are the canonical release trigger.
   push:
-    branches:
-      #- master
-      - 'ci*'
     tags:
       - '*'
 
