@@ -140,6 +140,35 @@ Reasons:
 * The script's args become the workflow's contract with the
   script: explicit, named, testable.
 
+### Naming: workflow YAML and its scripts share a prefix
+
+A workflow YAML and the ci scripts it invokes use the same base
+name (or share a prefix). A reader scanning either folder can find
+the matching counterpart at a glance:
+
+```
+.github/workflows/dry-run.yml
+                  ↕  (same prefix)
+ci/dry-run-derivative-maker.sh
+ci/dry-run-install.sh
+ci/dry-run-start-container.sh
+ci/dry-run-install-container-git.sh
+```
+
+Allowed exceptions:
+
+* Workflows that only call a third-party action and have no project
+  ci script (e.g. `codeql.yml`, `scorecard.yml`).
+* Generic shared installers that are reused by multiple workflows
+  (e.g. `ci/install-helper-scripts.sh`, `ci/install-genmkfile.sh`)
+  -- the "install-X" prefix indicates the shared helper, not a
+  workflow.
+
+If a script grows enough to need its own workflow file (e.g. a
+"live-probe" that's logically separate from the mock test suite it
+currently piggy-backs on), give it its own YAML with a matching
+name rather than tucking it into an unrelated workflow.
+
 ## Errors and logging
 
 Use `log` and `die` from `helper-scripts/log_run_die.sh`:
