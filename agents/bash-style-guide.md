@@ -117,6 +117,29 @@ empty count.
 Reuse strings.bsh's `is_whole_number`, `validate_safe_filename`,
 `check_is_alpha_numeric` etc. before reimplementing.
 
+## Workflow scripts: standalone, not inline
+
+Substantial bash logic does not belong inside a workflow YAML's
+`run: |` block. If the step is more than ~5 lines (or has any
+control flow, retry loop, polling, error handler), put it in a
+standalone script under `ci/` and have the workflow call it:
+
+```yaml
+- name: Start systemd-enabled Debian container
+  run: bash ci/dry-run-start-container.sh dryrun "${DEBIAN_IMAGE}"
+```
+
+Reasons:
+
+* shellcheck only sees real `.sh` files, not YAML blocks. Inline
+  shell silently bypasses linting.
+* A standalone script can be reproduced from a developer machine.
+  Inline-in-YAML is reproducible only by re-running the workflow.
+* Code review reads cleaner — diff is line-level, not embedded
+  inside YAML indentation games.
+* The script's args become the workflow's contract with the
+  script: explicit, named, testable.
+
 ## Errors and logging
 
 Use `log` and `die` from `helper-scripts/log_run_die.sh`:
