@@ -102,9 +102,40 @@ Empty `${HELPER_SCRIPTS_PATH}` -> system install at
 `/usr/libexec/helper-scripts/`. A caller running with helper-scripts
 as a submodule sets the variable to the submodule path.
 
+Each consumer sources every helper-scripts file it uses directly.
+Do not rely on transitive sourcing (one helper-scripts file pulling
+in another). For example, `log_run_die.sh` happens to source
+`strings.bsh` for its own use; if your script also calls
+`is_whole_number` from `strings.bsh`, source `strings.bsh` itself
+even if `log_run_die.sh` is already sourced. Otherwise a future
+refactor that drops the transitive source breaks you silently.
+
 `wc` invocations should be preceded by sourcing `wc-test.sh` so a
 broken `wc` binary fails loudly rather than silently producing an
 empty count.
+
+Reuse strings.bsh's `is_whole_number`, `validate_safe_filename`,
+`check_is_alpha_numeric` etc. before reimplementing.
+
+## Errors and logging
+
+Use `log` and `die` from `helper-scripts/log_run_die.sh`:
+
+```
+log error "couldn't read '${path}'"   ## log only
+log warn  "..."
+log info  "..."
+die 1 "fatal: ..."                     ## logs error then exit 1
+[ "$#" -ge 2 ] || die 64 "missing value for --include"
+```
+
+`die <code> <msg>` is the one-liner for "log error then exit." Use
+it for top-level fatal sites (parser guards, missing prerequisites,
+unrecoverable state). Inside a function that should return rather
+than exit, use `log error "..."; return N` instead.
+
+Don't write `printf '%s\n' 'error: ...' >&2; exit N`; that's the
+ad-hoc form `die` replaces.
 
 ## File deletion
 
