@@ -4,6 +4,37 @@ This guide collects the bash style choices applied to scripts under
 the assisted-by-ai org. Brief by design; the goal is "readable by both
 human reviewers and AI tools without a 50-page rulebook."
 
+## File header: AI-Assisted marker
+
+Every script (or substantial doc) created from scratch by an AI tool
+gets the literal token `AI-Assisted` in the file header, on its own
+comment line directly under the copyright block:
+
+```
+#!/bin/bash
+
+## Copyright (C) 2026 - 2026 ENCRYPTED SUPPORT LLC <adrelanos@whonix.org>
+## See the file COPYING for copying conditions.
+
+## AI-Assisted
+
+## <description of what the script does>
+```
+
+For Markdown files, append `(AI-Assisted)` to the H1 title:
+
+```
+# AGENTS.md (AI-Assisted)
+```
+
+This is the only attribution the project accepts. No author lines,
+no co-author lines, no individual credits in source files. The
+marker exists so reviewers can `grep -r AI-Assisted` to find files
+that warrant extra scrutiny, not as a credit line.
+
+Pre-existing files that an AI tool only edits do not get the marker
+unless the edit is substantial (rewrite, migration, restructure).
+
 ## Strict shell options
 
 Every new script starts with:
